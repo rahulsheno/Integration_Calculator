@@ -148,13 +148,7 @@ def parse_expression(expr_str: str):
     # Check for derivative/differentiation
     m = re.match(r'(?:differentiate|derivative(?:\s+of)?)\s+(.+)', expr_str, re.IGNORECASE)
     if m:
-        body = m.group(1).strip()
-        var = None
-        wrt_match = re.search(r'\bwith\s+respect\s+to\s+([a-zA-Z])\w*\s*$', body, re.IGNORECASE)
-        if wrt_match:
-            var = wrt_match.group(1).lower()
-            body = body[:wrt_match.start()].strip()
-        return "differentiate", body, var
+        return "differentiate", m.group(1).strip()
 
     # Check if we should treat it as an integration
     is_integral = ('integrate' in expr_str.lower() or 
@@ -195,29 +189,16 @@ def parse_expression(expr_str: str):
         integrand = re.sub(r'^∫\s*', '', integrand).strip()
         # Strip off leading "of "
         integrand = re.sub(r'^of\s+', '', integrand, flags=re.IGNORECASE).strip()
-
-        # Determine the variable of integration from the trailing d<var> (e.g.
-        # "dx", "dt", "dy") before stripping it off, defaulting to "x" if none
-        # is present. Without this, every integral was silently computed with
-        # respect to x regardless of what the problem actually asked for.
-        var_match = re.search(r'\bd([a-zA-Z])\s*$', integrand, re.IGNORECASE)
-        integration_var = var_match.group(1).lower() if var_match else "x"
         # Strip off trailing "dx", "dy", "dt" etc.
         integrand = re.sub(r'\s*d[a-z]\b\s*$', '', integrand, flags=re.IGNORECASE).strip()
 
         if lower is not None and upper is not None:
-            return "definite_integral", integrand, lower, upper, integration_var
-        return "integrate", integrand, integration_var
+            return "definite_integral", integrand, lower, upper
+        return "integrate", integrand
 
     # Check for differentiation hints
-    ddx_match = re.search(r'd\s*/\s*d\s*([a-zA-Z])', expr_str, re.IGNORECASE)
-    if ddx_match or 'derive' in expr_str.lower() or 'differentiate' in expr_str.lower():
-        var = ddx_match.group(1).lower() if ddx_match else None
-        body = expr_str
-        if ddx_match:
-            body = body[:ddx_match.start()] + body[ddx_match.end():]
-        body = re.sub(r'(?i)\b(?:differentiate|derivative(?:\s+of)?|derive)\b', '', body)
-        return "differentiate", body.strip(" ()"), var
+    if 'd/d' in expr_str.lower() or 'derive' in expr_str.lower() or 'differentiate' in expr_str.lower():
+        return "differentiate", expr_str
 
     if "=" in expr_str and not any(op in expr_str for op in ("<=", ">=", "!=")):
         return "solve_equation", expr_str
@@ -236,6 +217,9 @@ def safe_sympify(expr_str: str):
             'n': symbols('n', integer=True),
             'e': sp.E, 'pi': sp.pi, 'oo': sp.oo, 'infinity': sp.oo, 'infty': sp.oo,
             'sin': sin, 'cos': cos, 'tan': tan, 'cot': cot, 'sec': sec, 'csc': csc,
+            'sinh': sp.sinh, 'cosh': sp.cosh, 'tanh': sp.tanh,
+            'coth': sp.coth, 'sech': sp.sech, 'csch': sp.csch,
+            'asinh': sp.asinh, 'acosh': sp.acosh, 'atanh': sp.atanh,
             'arcsin': sp.asin, 'arccos': sp.acos, 'arctan': sp.atan,
             'ln': log, 'log': log, 'exp': exp, 'sqrt': sqrt, 'abs': sp.Abs,
             'integrate': integrate, 'Integrate': integrate, 'Integral': Integral,
@@ -361,6 +345,9 @@ def _detect_integration_technique(integrand_expr, expr):
     s = str(expr).lower()
     integrand_s = str(integrand_expr).lower()
 
+    if 'log(' in s and ('x**2' in integrand_s or 'x^2' in integrand_s):
+        if '+' in integrand_s.split('/')[0] if '/' in integrand_s else False:
+            pass
     if 'atan(' in s or 'atanh(' in s or 'acot(' in s:
         return "Partial Fractions" if 'x**' in integrand_s else "Integration of Rational Functions"
     if 'sqrt(' in integrand_s and 'sqrt(' in s:
@@ -377,6 +364,64 @@ def _detect_integration_technique(integrand_expr, expr):
     if '/' in integrand_s:
         return "Algebraic Manipulation / Partial Fractions"
     return "Standard Integration"
+
+
+def _best_simplify(expr):
+    """Try several simplification strategies and keep whichever produces the
+    fewest operations.
+
+    Plain sp.simplify() alone frequently fails to collapse expressions mixing
+    hyperbolic/trig functions with exponentials (e.g. results that came from
+    integrating sinh(x)/(cosh(x)-sinh(x))), because it never rewrites sinh/cosh
+    in terms of exp before trying to cancel terms. Left alone, the solver
+    displays a mathematically-correct but needlessly ugly answer like
+    "(x*sinh(x) - x*cosh(x) + sinh(x))*exp(x)/2 + C" instead of the true
+    simplest form "exp(2*x)/4 - x/2 + C". Trying multiple rewrites and scoring
+    them by op-count means we surface the simplest equivalent form we found,
+    without ever changing the underlying (already-correct) value.
+    """
+    if isinstance(expr, (int, float)) or not hasattr(expr, "free_symbols"):
+        return expr
+
+    candidates = [expr]
+
+    def _try(fn):
+        try:
+            result = fn(expr)
+            if result is not None:
+                candidates.append(result)
+        except Exception:
+            pass
+
+    _try(lambda e: simplify(e))
+    _try(lambda e: simplify(expand(e.rewrite(exp))))
+    _try(lambda e: trigsimp(expand(simplify(e))))
+    _try(lambda e: radsimp(together(simplify(e))))
+    _try(lambda e: sp.nsimplify(simplify(e), rational=False))
+
+    # Keep only candidates that are actually equal to the original (guards
+    # against a rewrite silently producing something non-equivalent), then
+    # pick whichever has the fewest operations - i.e. is visually simplest.
+    # Plain sp.simplify(c - expr) can fail to recognize the difference is zero
+    # when c and expr mix hyperbolic/trig functions with exponentials in
+    # different ways, so rewrite the difference in terms of exp first, which
+    # is a common representation both sides reduce to.
+    def _is_equivalent(c) -> bool:
+        try:
+            if sp.simplify(c - expr) == 0:
+                return True
+        except Exception:
+            pass
+        try:
+            return sp.simplify(sp.expand((c - expr).rewrite(exp))) == 0
+        except Exception:
+            return False
+
+    valid = [c for c in candidates if _is_equivalent(c)]
+
+    if not valid:
+        return expr
+    return min(valid, key=lambda c: sp.count_ops(c))
 
 
 def _clean_result(expr) -> str:
@@ -638,13 +683,7 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
             try:
                 pt_val = float(sp.N(safe_sympify(pt)[0]))
             except Exception:
-                pt_stripped = pt.strip()
-                if pt_stripped in ('-oo', '-∞', '-inf', '-infinity'):
-                    pt_val = -sp.oo
-                elif pt_stripped in ('oo', '∞', 'inf', 'infinity'):
-                    pt_val = sp.oo
-                else:
-                    pt_val = 0
+                pt_val = sp.oo if pt.strip() in ('oo', '∞', 'inf', 'infinity') else 0
 
             question_latex = f"\\lim_{{{var} \\to {pt}}} {latex(expr)}"
 
@@ -703,25 +742,19 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
 
         elif parsed[0] == "differentiate":
             func_expr = parsed[1]
-            requested_var = parsed[2] if len(parsed) > 2 else None
             expr, err = safe_sympify(func_expr)
 
             if expr is None:
                 return _with_math_context(_fallback_response(expression, topic, confidence), expression, parsed, request.session_id)
 
-            # Differentiate with respect to the variable the user asked for
-            # (or, failing that, the expression's own free variable) instead
-            # of always assuming x - e.g. "derivative of t^2 with respect to t".
-            diff_var = _pick_symbol(expr, requested_var)
-
-            question_latex = f"\\frac{{d}}{{d{diff_var}}} \\left( {latex(expr)} \\right)"
+            question_latex = f"\\frac{{d}}{{dx}} \\left( {latex(expr)} \\right)"
 
             steps.append(StepDetail(
                 step_number=1,
                 description="Identify the function to differentiate",
                 expression=str(expr),
                 expression_latex=latex(expr),
-                justification=f"We need to find the derivative with respect to {diff_var}."
+                justification="We need to find the derivative with respect to x."
             ))
 
             steps.append(StepDetail(
@@ -731,7 +764,7 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
                 justification="Break down the function and apply the appropriate differentiation rules."
             ))
 
-            deriv = diff(expr, diff_var)
+            deriv = diff(expr, x)
             simplified = simplify(deriv)
 
             steps.append(StepDetail(
@@ -749,12 +782,12 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
 
             formulas_used.append(FormulaUsed(
                 name="Power Rule",
-                formula_latex=rf"\frac{{d}}{{d{diff_var}}} {diff_var}^n = n {diff_var}^{{n-1}}",
-                description=f"Derivative of {diff_var} raised to power n."
+                formula_latex=r"\frac{d}{dx} x^n = n x^{n-1}",
+                description="Derivative of x raised to power n."
             ))
             formulas_used.append(FormulaUsed(
                 name="Chain Rule",
-                formula_latex=rf"\frac{{d}}{{d{diff_var}}} f(g({diff_var})) = f'(g({diff_var})) \cdot g'({diff_var})",
+                formula_latex=r"\frac{d}{dx} f(g(x)) = f'(g(x)) \cdot g'(x)",
                 description="Derivative of composite functions."
             ))
 
@@ -769,26 +802,28 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
 
         elif parsed[0] == "definite_integral":
             integrand_expr, lower_str, upper_str = parsed[1], parsed[2], parsed[3]
-            int_var_name = parsed[4] if len(parsed) > 4 else "x"
             expr, err = safe_sympify(integrand_expr)
             if expr is None:
                 return _with_math_context(_fallback_response(expression, topic, confidence, err), expression, parsed, request.session_id)
 
-            int_var = _pick_symbol(expr, int_var_name)
-
-            try:
-                # Keep exact/symbolic bounds where possible for precise analytical results
-                lower_val = sp.sympify(lower_str)
-                upper_val = sp.sympify(upper_str)
-            except Exception:
+            # Use the same implicit-multiplication-aware parser as the
+            # integrand (safe_sympify) rather than bare sp.sympify, which
+            # can't parse bounds like "2pi" (no explicit '*') and would
+            # raise an uncaught SyntaxError further down.
+            lower_val, lower_err = safe_sympify(lower_str)
+            upper_val, upper_err = safe_sympify(upper_str)
+            if lower_val is None or upper_val is None:
                 try:
                     lower_val = float(lower_str)
                     upper_val = float(upper_str)
                 except Exception:
-                    lower_val = sp.sympify(lower_str)
-                    upper_val = sp.sympify(upper_str)
+                    bound_err = lower_err if lower_val is None else upper_err
+                    return _with_math_context(
+                        _fallback_response(expression, topic, confidence, bound_err),
+                        expression, parsed, request.session_id,
+                    )
 
-            question_latex = f"\\int_{{{lower_str}}}^{{{upper_str}}} {latex(expr)} \\, d{int_var}"
+            question_latex = f"\\int_{{{lower_str}}}^{{{upper_str}}} {latex(expr)} \\, dx"
 
             steps.append(StepDetail(
                 step_number=1,
@@ -800,24 +835,24 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
             steps.append(StepDetail(
                 step_number=2,
                 description="Find the antiderivative",
-                expression=f"Compute ∫ {integrand_expr} d{int_var}",
-                justification=f"First find F({int_var}) such that F'({int_var}) equals the integrand."
+                expression=f"Compute ∫ {integrand_expr} dx",
+                justification="First find F(x) such that F'(x) equals the integrand."
             ))
 
             try:
                 # Try integrating simplified expression first
-                result = integrate(simplify(expr), (int_var, lower_val, upper_val))
+                result = integrate(simplify(expr), (x, lower_val, upper_val))
             except Exception:
                 try:
-                    result = integrate(expr, (int_var, lower_val, upper_val))
+                    result = integrate(expr, (x, lower_val, upper_val))
                 except Exception:
                     try:
-                        result = sp.N(integrate(expr, (int_var, lower_val, upper_val)))
+                        result = sp.N(integrate(expr, (x, lower_val, upper_val)))
                     except Exception:
-                        antideriv = integrate(simplify(expr), int_var)
-                        result = simplify(sp.N(antideriv.subs(int_var, upper_val) - antideriv.subs(int_var, lower_val)))
+                        antideriv = integrate(simplify(expr), x)
+                        result = simplify(sp.N(antideriv.subs(x, upper_val) - antideriv.subs(x, lower_val)))
 
-            simplified = simplify(result) if not isinstance(result, (int, float)) else result
+            simplified = _best_simplify(result) if not isinstance(result, (int, float)) else result
 
             steps.append(StepDetail(
                 step_number=3,
@@ -846,20 +881,15 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
 
         elif parsed[0] == "integrate":
             integrand = parsed[1]
-            int_var_name = parsed[2] if len(parsed) > 2 else "x"
 
-            # Check for definite integral bounds embedded directly in the integrand text
-            def_match = re.search(
-                r'(?:integrate|∫)\s*(.+?)\s*d([a-zA-Z])\s*(?:from\s+(.+?)\s+to\s+(.+)|_\{([^}]+)\}\^\{([^}]+)\})',
-                integrand, re.IGNORECASE,
-            )
+            # Check for definite integral bounds
+            def_match = re.search(r'(?:integrate|∫)\s*(.+?)\s*(?:dx|dy|dz|dt)\s*(?:from\s+(.+?)\s+to\s+(.+)|_\{([^}]+)\}\^\{([^}]+)\})', integrand, re.IGNORECASE)
             if def_match:
                 integrand_expr = def_match.group(1)
-                int_var_name = def_match.group(2).lower()
-                lower = def_match.group(3) or def_match.group(5) or "0"
-                upper = def_match.group(4) or def_match.group(6) or "1"
+                lower = def_match.group(2) or def_match.group(4) or "0"
+                upper = def_match.group(3) or def_match.group(5) or "1"
             else:
-                integrand_expr = re.sub(r'(?i)\bintegrate\b|\bd[a-z]\b', '', integrand).replace("∫", "").strip()
+                integrand_expr = integrand.replace("integrate", "").replace("∫", "").replace("dx", "").replace("dy", "").replace("dz", "").replace("dt", "").strip()
                 lower = None
                 upper = None
 
@@ -871,14 +901,12 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
             if expr is None:
                 return _with_math_context(_fallback_response(expression, topic, confidence, err), expression, parsed, request.session_id)
 
-            int_var = _pick_symbol(expr, int_var_name)
-
             if lower is not None and upper is not None:
-                question_latex = f"\\int_{{{lower}}}^{{{upper}}} {latex(expr)} \\, d{int_var}"
+                question_latex = f"\\int_{{{lower}}}^{{{upper}}} {latex(expr)} \\, dx"
                 steps.append(StepDetail(
                     step_number=1,
                     description="Identify the definite integral",
-                    expression=f"∫_{lower}^{upper} {expr} d{int_var}",
+                    expression=f"∫_{lower}^{upper} {expr} dx",
                     expression_latex=question_latex,
                     justification="This is a definite integral with bounds."
                 ))
@@ -886,39 +914,50 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
                 steps.append(StepDetail(
                     step_number=2,
                     description="Find the antiderivative (indefinite integral)",
-                    expression=f"Find F({int_var}) such that F'({int_var}) = {expr}",
+                    expression=f"Find F(x) such that F'(x) = {expr}",
                     justification="First compute the indefinite integral."
                 ))
 
                 try:
-                    antideriv = integrate(expr, int_var)
+                    antideriv = integrate(expr, x)
                 except Exception:
-                    antideriv = integrate(expr, int_var, risch=False)
+                    antideriv = integrate(expr, x, risch=False)
+
+                lower_val, lower_err = safe_sympify(lower)
+                upper_val, upper_err = safe_sympify(upper)
+                if lower_val is None or upper_val is None:
+                    try:
+                        lower_val = float(lower)
+                        upper_val = float(upper)
+                    except Exception:
+                        bound_err = lower_err if lower_val is None else upper_err
+                        return _with_math_context(
+                            _fallback_response(expression, topic, confidence, bound_err),
+                            expression, parsed, request.session_id,
+                        )
 
                 steps.append(StepDetail(
                     step_number=3,
                     description="Evaluate at bounds using FTC",
                     expression=f"F({upper}) - F({lower})",
-                    expression_latex=f"F({latex(sp.sympify(upper))}) - F({latex(sp.sympify(lower))})",
+                    expression_latex=f"F({latex(upper_val)}) - F({latex(lower_val)})",
                     justification="Fundamental Theorem of Calculus: ∫_a^b f(x)dx = F(b) - F(a)."
                 ))
 
                 try:
-                    lower_val = sp.sympify(lower)
-                    upper_val = sp.sympify(upper)
-                    result = integrate(simplify(expr), (int_var, lower_val, upper_val))
+                    result = integrate(simplify(expr), (x, lower_val, upper_val))
                 except Exception:
                     try:
-                        result = integrate(expr, (int_var, sp.sympify(lower), sp.sympify(upper)))
+                        result = integrate(expr, (x, lower_val, upper_val))
                     except Exception:
                         try:
-                            result = sp.N(integrate(expr, (int_var, sp.sympify(lower), sp.sympify(upper))))
+                            result = sp.N(integrate(expr, (x, lower_val, upper_val)))
                         except Exception:
-                            lower_val = float(sp.N(sp.sympify(lower)))
-                            upper_val = float(sp.N(sp.sympify(upper)))
-                            result = integrate(expr, (int_var, lower_val, upper_val))
+                            lower_val = float(sp.N(lower_val))
+                            upper_val = float(sp.N(upper_val))
+                            result = integrate(expr, (x, lower_val, upper_val))
 
-                simplified = simplify(result) if not isinstance(result, float) else result
+                simplified = _best_simplify(result) if not isinstance(result, float) else result
 
                 steps.append(StepDetail(
                     step_number=4,
@@ -939,7 +978,7 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
                     description="Connects differentiation and integration."
                 ))
             else:
-                question_latex = f"\\int {latex(expr)} \\, d{int_var}"
+                question_latex = f"\\int {latex(expr)} \\, dx"
                 technique = _detect_integration_technique(integrand_expr, expr)
 
                 steps.append(StepDetail(
@@ -958,17 +997,17 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
                 ))
 
                 try:
-                    result = integrate(simplify(expr), int_var)
+                    result = integrate(simplify(expr), x)
                 except Exception:
                     try:
-                        result = integrate(expr, int_var)
+                        result = integrate(expr, x)
                     except Exception:
                         try:
-                            result = integrate(expr, int_var, risch=False)
+                            result = integrate(expr, x, risch=False)
                         except Exception:
-                            result = sp.Integral(expr, int_var)
+                            result = sp.Integral(expr, x)
 
-                simplified = simplify(result)
+                simplified = _best_simplify(result)
 
                 steps.append(StepDetail(
                     step_number=3,

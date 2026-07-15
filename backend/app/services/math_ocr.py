@@ -63,10 +63,16 @@ def extract_math_expression_from_image(filepath: str) -> MathOcrResult:
     if vision_expression:
         return MathOcrResult(expression=vision_expression, raw_text="\n".join(all_raw_text), confidence=0.75)
 
+    # Nothing normalized successfully. Show the single most representative
+    # raw attempt rather than every dead-end candidate concatenated together
+    # - joining a dedicated-OCR misread with an unrelated, unvalidated
+    # vision-LLM guess produced a confusing scrambled multi-line dump instead
+    # of one coherent (if wrong) line the user could actually make sense of.
+    best_raw = latex_candidates[0] if latex_candidates else vision_raw
     return MathOcrResult(
         expression="",
-        raw_text="\n".join(all_raw_text),
-        confidence=0.25 if all_raw_text else 0.0,
+        raw_text=best_raw or "",
+        confidence=0.25 if best_raw else 0.0,
     )
 
 
@@ -316,6 +322,46 @@ def normalize_latex_math(latex_text: str) -> str:
     return fallback
 
 
+_MATHRM_HYPERBOLIC_RECIPROCALS = {
+    "sech": r"\cosh",
+    "csch": r"\sinh",
+}
+
+
+def _rewrite_mathrm_hyperbolic_reciprocals(text: str) -> str:
+    """OCR engines commonly wrap non-standard LaTeX function names in
+    \\mathrm{...} or \\operatorname{...}, since \\sech and \\csch aren't real
+    LaTeX commands (unlike \\sinh, \\cosh, \\tanh, \\coth, which are). Left as
+    e.g. \\mathrm{sech}, downstream parsing degrades badly: once the wrapper
+    is stripped to a bare word with no distinguishing backslash, both
+    latex2sympy2 and our own fallback parse "sech(x)" as four separate
+    one-letter variables s, e, c, h multiplied together rather than a single
+    function call. Rewriting straight to the reciprocal (sech(x) = 1/cosh(x),
+    csch(x) = 1/sinh(x)) sidesteps the ambiguity entirely, since \\cosh/\\sinh
+    are real commands both parsers already handle correctly.
+    """
+    for name, replacement in _MATHRM_HYPERBOLIC_RECIPROCALS.items():
+        for wrapper in (r"\mathrm", r"\operatorname"):
+            marker = f"{wrapper}{{{name}}}"
+            while marker in text:
+                idx = text.index(marker)
+                arg_start = idx + len(marker)
+                arg, end = _consume_balanced_braces(text, arg_start)
+                if arg is not None:
+                    text = f"{text[:idx]}\\frac{{1}}{{{replacement}{{{arg}}}}}{text[end:]}"
+                    continue
+                # Bare/parenthesized argument (no braces), e.g. "\mathrm{sech}(x)"
+                paren_match = re.match(r"\(([^()]*)\)", text[arg_start:])
+                if paren_match:
+                    arg = paren_match.group(1)
+                    end = arg_start + paren_match.end()
+                    text = f"{text[:idx]}\\frac{{1}}{{{replacement}({arg})}}{text[end:]}"
+                    continue
+                # No recognizable argument - leave as-is rather than loop forever
+                break
+    return text
+
+
 def _clean_latex_text(latex_text: str) -> str:
     text = latex_text.strip()
     text = re.sub(r"^```(?:latex)?|```$", "", text).strip()
@@ -324,6 +370,7 @@ def _clean_latex_text(latex_text: str) -> str:
     text = text.replace(r"\,", " ").replace(r"\!", "").replace(r"\ ", " ").replace(r"\;", " ")
     text = text.replace(r"\mathrm{d}", "d")
     text = text.replace(r"\operatorname{d}", "d")
+    text = _rewrite_mathrm_hyperbolic_reciprocals(text)
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -335,15 +382,24 @@ def _integral_expression_from_latex(text: str) -> str:
     if not integral_match:
         return ""
 
-    lower = integral_match.group(1)
-    upper = integral_match.group(2)
+    lower_latex = integral_match.group(1)
+    upper_latex = integral_match.group(2)
     integrand_latex = integral_match.group(3).strip()
     variable = integral_match.group(4)
     integrand = _latex_expression_to_plain(integrand_latex)
     if not integrand or _has_untranslated_latex_artifacts(integrand):
         return ""
 
-    if lower is not None and upper is not None:
+    if lower_latex is not None and upper_latex is not None:
+        # Bounds can themselves contain LaTeX (e.g. "2\pi", "\infty") - run
+        # them through the same conversion as the integrand rather than
+        # using the raw captured substring directly, or a bound like "2\pi"
+        # would keep its literal backslash and get the whole integral
+        # rejected by the artifact guard below, even though it OCR'd fine.
+        lower = _latex_expression_to_plain(lower_latex)
+        upper = _latex_expression_to_plain(upper_latex)
+        if not lower or not upper or _has_untranslated_latex_artifacts(f"{lower} {upper}"):
+            return ""
         return f"integrate {integrand} d{variable} from {lower} to {upper}"
     return f"integrate {integrand} d{variable}"
 
@@ -369,7 +425,8 @@ def _latex_expression_to_plain(text: str) -> str:
 _KNOWN_MATH_WORDS = {
     "sin", "cos", "tan", "cot", "sec", "csc",
     "asin", "acos", "atan", "acot", "asec", "acsc",
-    "sinh", "cosh", "tanh", "coth",
+    "sinh", "cosh", "tanh", "coth", "sech", "csch",
+    "asinh", "acosh", "atanh", "acoth", "asech", "acsch",
     "sqrt", "log", "ln", "exp", "pi",
     # scaffolding words this module itself generates, e.g. "integrate x+1 dx
     # from 0 to 1" - these must never be flagged as untranslated LaTeX.

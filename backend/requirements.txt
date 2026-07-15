@@ -1,0 +1,27 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+sqlalchemy>=2.0.35
+alembic>=1.13.0
+pydantic>=2.9.0
+pydantic-settings>=2.5.0
+sympy>=1.13.0
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+# passlib 1.7.4's bcrypt backend reads bcrypt.__about__.__version__, which was
+# removed in bcrypt 4.1+, causing "AttributeError: module 'bcrypt' has no
+# attribute '__about__'" on password hashing. Pin below that until passlib
+# ships a fix.
+bcrypt>=4.0.1,<4.1
+python-multipart>=0.0.12
+aiofiles>=24.1.0
+pillow>=10.4.0
+pix2text>=1.1.0
+pix2tex>=0.1.4
+latex2sympy2>=1.9.1
+httpx>=0.27.0
+matplotlib>=3.9.0
+numpy>=2.0.0
+scipy>=1.14.0
+reportlab>=4.2.0
+aiosqlite>=0.20.0
+python-dotenv>=1.0.1

@@ -1,0 +1,18 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      # Bind-mount source so `--reload` picks up your edits without rebuilding.
+      - ./backend:/app
+      # Named volume so pix2tex/pix2text/torch model weights only download
+      # once, instead of every time the container restarts.
+      - model_cache:/root/.cache
+    environment:
+      - PYTHONUNBUFFERED=1
+
+volumes:
+  model_cache:

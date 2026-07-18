@@ -71,6 +71,11 @@ class Question(Base):
     view_count = Column(Integer, default=0)
     notes = Column(Text, nullable=True)
     collection_id = Column(String(36), ForeignKey("collections.id", ondelete="SET NULL"), nullable=True)
+    # Hash of the normalized question text, used to detect and reuse
+    # duplicate saves instead of storing the same solved question
+    # repeatedly. Indexed (not unique) since duplicates can legitimately
+    # live in different collections.
+    content_hash = Column(String(64), nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

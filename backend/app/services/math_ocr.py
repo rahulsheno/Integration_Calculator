@@ -362,6 +362,37 @@ def _rewrite_mathrm_hyperbolic_reciprocals(text: str) -> str:
     return text
 
 
+_STANDARD_MATHRM_FUNCTION_NAMES = (
+    "sin", "cos", "tan", "cot", "sec", "csc",
+    "sinh", "cosh", "tanh", "coth",
+    "log", "ln", "exp",
+)
+
+
+def _rewrite_mathrm_standard_functions(text: str) -> str:
+    """OCR engines sometimes wrap even standard function names - which DO
+    have their own real LaTeX macros, e.g. \\cos - in \\mathrm{...} or
+    \\operatorname{...} anyway, apparently triggered by font styling cues
+    in the source image rather than the name actually being non-standard
+    (unlike \\sech/\\csch below, which genuinely have no native macro).
+
+    Left wrapped, latex2sympy2 treats e.g. "\\mathrm{cos}" as an opaque
+    symbol name rather than the cosine function. This doesn't raise an
+    exception, so it isn't caught the way a hard parse failure would be -
+    it silently mis-parses the surrounding structure instead (observed:
+    an adjacent term's argument got swallowed into the wrong function's
+    argument via implicit multiplication). The artifact guard still
+    rejects the resulting garbage (the raw backslash survives), so nothing
+    wrong gets shown - but that means a problem that should have solved
+    correctly was rejected instead. Unwrapping to the real macro upfront
+    fixes it at the source rather than just safely discarding it.
+    """
+    for name in _STANDARD_MATHRM_FUNCTION_NAMES:
+        for wrapper in (r"\mathrm", r"\operatorname"):
+            text = text.replace(f"{wrapper}{{{name}}}", f"\\{name}")
+    return text
+
+
 def _clean_latex_text(latex_text: str) -> str:
     text = latex_text.strip()
     text = re.sub(r"^```(?:latex)?|```$", "", text).strip()
@@ -370,24 +401,52 @@ def _clean_latex_text(latex_text: str) -> str:
     text = text.replace(r"\,", " ").replace(r"\!", "").replace(r"\ ", " ").replace(r"\;", " ")
     text = text.replace(r"\mathrm{d}", "d")
     text = text.replace(r"\operatorname{d}", "d")
+    text = _rewrite_mathrm_standard_functions(text)
     text = _rewrite_mathrm_hyperbolic_reciprocals(text)
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _integral_expression_from_latex(text: str) -> str:
-    integral_match = re.search(
-        r"\\int(?:_\{?([^}^{\s]+)\}?|\s*)?(?:\^\{?([^}^{\s]+)\}?)?\s*(.+?)\s*d\s*([a-zA-Z])\s*$",
-        text,
-    )
-    if not integral_match:
-        return ""
+def _consume_bound(text: str, pos: int) -> tuple[str | None, int]:
+    """Consume one integral bound starting at `pos`: either a balanced
+    {...} group (which may itself contain nested braces, e.g.
+    \\frac{\\pi}{2}), or a single bare token like "0" or "\\pi"."""
+    if pos < len(text) and text[pos] == "{":
+        return _consume_balanced(text, pos, "{", "}")
+    tok_match = re.match(r"\\?[a-zA-Z0-9]+", text[pos:])
+    if not tok_match:
+        return None, pos
+    return tok_match.group(0), pos + tok_match.end()
 
-    lower_latex = integral_match.group(1)
-    upper_latex = integral_match.group(2)
-    integrand_latex = integral_match.group(3).strip()
-    variable = integral_match.group(4)
+
+def _integral_expression_from_latex(text: str) -> str:
+    start_match = re.match(r"\\int\s*", text)
+    if not start_match:
+        return ""
+    pos = start_match.end()
+
+    # Bounds can appear as _{...}^{...} or ^{...}_{...}, and each may be a
+    # balanced {...} group (itself possibly containing nested braces, e.g.
+    # \frac{\pi}{2} as the upper bound) or a bare token like "0" or "\pi".
+    # A naive regex character class that simply excludes '{'/'}' breaks the
+    # instant a bound contains its own internal braces - which \frac{a}{b}
+    # bounds do constantly - so this walks the string by hand instead.
+    lower_latex = None
+    upper_latex = None
+    for _ in range(2):
+        if pos < len(text) and text[pos] == "_":
+            lower_latex, pos = _consume_bound(text, pos + 1)
+        elif pos < len(text) and text[pos] == "^":
+            upper_latex, pos = _consume_bound(text, pos + 1)
+        else:
+            break
+
+    end_match = re.search(r"\s*(.+?)\s*d\s*([a-zA-Z])\s*$", text[pos:])
+    if not end_match:
+        return ""
+    integrand_latex = end_match.group(1).strip()
+    variable = end_match.group(2)
     integrand = _latex_expression_to_plain(integrand_latex)
-    if not integrand or _has_untranslated_latex_artifacts(integrand):
+    if not _is_valid_math_fragment(integrand):
         return ""
 
     if lower_latex is not None and upper_latex is not None:
@@ -398,7 +457,7 @@ def _integral_expression_from_latex(text: str) -> str:
         # rejected by the artifact guard below, even though it OCR'd fine.
         lower = _latex_expression_to_plain(lower_latex)
         upper = _latex_expression_to_plain(upper_latex)
-        if not lower or not upper or _has_untranslated_latex_artifacts(f"{lower} {upper}"):
+        if not _is_valid_math_fragment(lower) or not _is_valid_math_fragment(upper):
             return ""
         return f"integrate {integrand} d{variable} from {lower} to {upper}"
     return f"integrate {integrand} d{variable}"
@@ -450,13 +509,128 @@ def _has_untranslated_latex_artifacts(expression: str) -> bool:
         if re.fullmatch(r"d[a-zA-Z]", word.lower()):  # dx, dy, dz, dt, ...
             continue
         return True
+    # Isolated single uppercase letters don't match the {2,} scan above,
+    # but are a very common OCR misread of a digit (e.g. "0" -> "D" or
+    # "O", "5" -> "S") - exactly what turned "2026" into "2D/6" in one
+    # real case. The variables this solver actually recognizes are all
+    # lowercase (x, y, z, t, u, v, n); "I" (imaginary unit) is the sole
+    # legitimate standalone uppercase letter, so anything else isolated
+    # is treated as a probable misread rather than an intentional symbol.
+    for letter in re.findall(r"(?<![a-zA-Z])[A-Z](?![a-zA-Z])", expression):
+        if letter != "I":
+            return True
     return False
+
+
+def _is_sympy_parseable(text: str) -> bool:
+    """Actually attempt a sympy parse of `text`, as a second, independent
+    check alongside _has_untranslated_latex_artifacts.
+
+    That word-level check only scans for runs of 2+ letters, so a single
+    stray character - e.g. an OCR misread of "2026" as "2D/6" ("0" read as
+    "D") - sails straight through it undetected: "D" alone never matches
+    the {2,} pattern. "2D" is then a genuine Python tokenizer SyntaxError
+    (a digit directly touching a letter, unlike valid implicit
+    multiplication such as "2x" which the parser handles as 2*x), which
+    previously wasn't caught until deep inside the solver, where the raw
+    exception text leaked straight into the user-facing answer.
+
+    This is deliberately permissive about *which* symbols are used (any
+    single-letter name parses fine as a plausible variable) - it only
+    catches things that are syntactically broken, not semantically unusual
+    variable choices, so it won't reject legitimate expressions.
+    """
+    if not text:
+        return False
+    try:
+        from sympy.parsing.sympy_parser import (
+            parse_expr,
+            standard_transformations,
+            implicit_multiplication_application,
+            convert_xor,
+        )
+
+        transformations = standard_transformations + (implicit_multiplication_application, convert_xor)
+        parse_expr(text.replace("^", "**"), transformations=transformations, evaluate=False)
+        return True
+    except Exception:
+        return False
+
+
+def _is_valid_math_fragment(text: str) -> bool:
+    """Combined validity check for a bare mathematical sub-expression (an
+    integrand or a bound, not the full "integrate ... dx from ... to ..."
+    wrapper sentence, which is never valid bare sympy syntax on its own).
+    Used everywhere a candidate integrand/bound is accepted."""
+    return bool(text) and not _has_untranslated_latex_artifacts(text) and _is_sympy_parseable(text)
+
+
+_POWERABLE_LATEX_FUNCS = (
+    "sin", "cos", "tan", "cot", "sec", "csc",
+    "sinh", "cosh", "tanh", "coth", "sech", "csch",
+    "log", "ln", "exp",
+)
+
+
+def _rewrite_latex_function_powers(text: str) -> str:
+    """Rewrite "\\FUNC^{n}{arg}" or "\\FUNC^{n}(arg)" (n and arg may each
+    be a braced group or a bare token) into "FUNC(arg)^(n)".
+
+    latex2sympy2 does this restructuring automatically when it can parse
+    the input; this fallback previously didn't, leaving the literal
+    juxtaposition "FUNC^(n)(arg)" - which isn't valid math (a function
+    reference raised to a power, then immediately "called" on arg) and
+    caused a raw Python SyntaxError several layers downstream in the
+    solver whenever latex2sympy2 failed to parse something (e.g. an OCR
+    misread digit produced an exponent like "2D/6" that tripped up its
+    grammar) and execution fell back to this function.
+    """
+    result = []
+    i = 0
+    func_re = re.compile(r"\\(" + "|".join(_POWERABLE_LATEX_FUNCS) + r")\^")
+    while i < len(text):
+        m = func_re.match(text, i)
+        if not m:
+            result.append(text[i])
+            i += 1
+            continue
+
+        func_name = m.group(1)
+        pos = m.end()
+
+        if pos < len(text) and text[pos] == "{":
+            exponent, new_pos = _consume_balanced(text, pos, "{", "}")
+        else:
+            tok_match = re.match(r"-?[0-9A-Za-z]+(?:/[0-9A-Za-z]+)?", text[pos:])
+            exponent = tok_match.group(0) if tok_match else None
+            new_pos = pos + len(exponent) if exponent else pos
+        if exponent is None:
+            result.append(text[i])
+            i += 1
+            continue
+        pos = new_pos
+
+        if pos < len(text) and text[pos] == "{":
+            arg, new_pos = _consume_balanced(text, pos, "{", "}")
+        elif pos < len(text) and text[pos] == "(":
+            arg, new_pos = _consume_balanced(text, pos, "(", ")")
+        else:
+            arg, new_pos = None, pos
+        if arg is None:
+            result.append(text[i])
+            i += 1
+            continue
+
+        result.append(f"{func_name}({arg})^({exponent})")
+        i = new_pos
+    return "".join(result)
 
 
 def _latex_to_plain_fallback(text: str) -> str:
     plain = text
     plain = _replace_balanced_command(plain, r"\frac", 2, lambda args: f"({args[0]})/({args[1]})")
     plain = _replace_balanced_command(plain, r"\sqrt", 1, lambda args: f"sqrt({args[0]})")
+    plain = _rewrite_latex_function_powers(plain)
     # Handle bare (brace-less) function application like "\cos x" or
     # "\sin 2x" BEFORE the generic name replacement below. Without this,
     # "\cos x" becomes "cos" + "x" and then, once all whitespace is
@@ -507,13 +681,17 @@ def _replace_balanced_command(text: str, command: str, arg_count: int, render) -
 
 
 def _consume_balanced_braces(text: str, pos: int) -> tuple[str | None, int]:
-    if pos >= len(text) or text[pos] != "{":
+    return _consume_balanced(text, pos, "{", "}")
+
+
+def _consume_balanced(text: str, pos: int, open_ch: str, close_ch: str) -> tuple[str | None, int]:
+    if pos >= len(text) or text[pos] != open_ch:
         return None, pos
     depth = 0
     for j in range(pos, len(text)):
-        if text[j] == "{":
+        if text[j] == open_ch:
             depth += 1
-        elif text[j] == "}":
+        elif text[j] == close_ch:
             depth -= 1
             if depth == 0:
                 return text[pos + 1 : j], j + 1
@@ -610,7 +788,7 @@ def _integral_expression_from_normalized_text(text: str) -> str:
     if direct_integral and "/" not in direct_integral.group(1):
         integrand = _normalize_integrand(direct_integral.group(1))
         variable = direct_integral.group(2)
-        if integrand:
+        if _is_valid_math_fragment(integrand):
             return f"integrate {integrand} d{variable}"
 
     roots = re.findall(r"sqrt\(x[+-]\d+\)", compact)
@@ -620,7 +798,8 @@ def _integral_expression_from_normalized_text(text: str) -> str:
         if "+" in between and "-" not in between:
             sign = "+"
         denominator = f"{roots[0]}{sign}{roots[1]}"
-        return f"integrate 1/({denominator}) dx"
+        if _is_valid_math_fragment(denominator):
+            return f"integrate 1/({denominator}) dx"
 
     fraction_match = re.search(
         r"(?:integral|int)?(?:dx)?/(\(.+\)|.+?)(?:dx)?$",
@@ -629,7 +808,7 @@ def _integral_expression_from_normalized_text(text: str) -> str:
     )
     if fraction_match:
         denominator = _strip_balanced_outer_parentheses(fraction_match.group(1))
-        if denominator:
+        if _is_valid_math_fragment(denominator):
             return f"integrate 1/({denominator}) dx"
 
     return ""
@@ -811,7 +990,7 @@ def _parse_vision_llm_output(raw_text: str) -> str:
 
     integrand = match.group("integrand").strip()
     variable = match.group("var")
-    if not integrand or _has_untranslated_latex_artifacts(integrand):
+    if not _is_valid_math_fragment(integrand):
         return ""
 
     lower = match.group("lower")

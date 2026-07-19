@@ -30,11 +30,38 @@ import sympy as sp
 from sympy.calculus.util import periodicity
 
 
+def _is_finite_bound(val) -> bool:
+    """True only for a genuinely finite numeric bound. Both techniques below
+    assume a bounded interval [a, b] - King's rule reflects x -> a+b-x (which
+    degenerates to a meaningless x -> ∞-x, i.e. just ∞ again, when either
+    bound is infinite), and the periodicity count divides the interval's
+    span by the period (which is itself infinite, or produces an infinite
+    period count, over an unbounded interval). Rather than let sympy grind
+    through a substitution or division it can't meaningfully do and hand
+    back "nan" (or an infinite loop's worth of periods) as if it were a
+    real, verified answer, bail out up front whenever a bound isn't finite.
+    """
+    try:
+        return bool(val.is_finite)
+    except Exception:
+        return False
+
+
 def try_symmetry_substitution(expr, var, lower_val, upper_val):
     """Attempt the a+b-x symmetry substitution ("King's rule"). Returns the
     resulting definite integral value, or None if the substitution doesn't
     simplify things (i.e. isn't worth using) or can't be evaluated.
     """
+    if not (_is_finite_bound(lower_val) and _is_finite_bound(upper_val)):
+        # x -> a+b-x only makes sense as a reflection of a bounded interval
+        # onto itself. With an infinite bound (e.g. upper_val = oo), a+b-x
+        # is just ∞-x, which sympy simplifies straight back to ∞ regardless
+        # of x - substituting that in doesn't reflect anything, and
+        # previously produced "nan" for the whole combined expression
+        # (confirmed: log(tanh(x/2)) over [0, oo) silently returned "nan"
+        # as if it were a verified answer, via exactly this path).
+        return None
+
     try:
         reflected = expr.subs(var, lower_val + upper_val - var)
         combined = sp.simplify(expr + reflected)
@@ -61,7 +88,13 @@ def try_symmetry_substitution(expr, var, lower_val, upper_val):
     if half_integral is None or isinstance(half_integral, sp.Integral) or half_integral.has(sp.Integral):
         return None
 
-    return sp.simplify(half_integral / 2)
+    result = sp.simplify(half_integral / 2)
+    # Belt-and-suspenders: even with the finite-bounds guard above, if
+    # sympy's own simplification chain ever produces nan/complex-infinity
+    # some other way, don't hand that back as if it were a real result.
+    if result in (sp.nan, sp.zoo) or (hasattr(result, "has") and result.has(sp.nan)):
+        return None
+    return result
 
 
 def try_periodicity_reduction(expr, var, lower_val, upper_val):
@@ -73,6 +106,14 @@ def try_periodicity_reduction(expr, var, lower_val, upper_val):
     doesn't span at least 2 full periods (not worth it for fewer), or
     evaluation fails.
     """
+    if not (_is_finite_bound(lower_val) and _is_finite_bound(upper_val)):
+        # "How many periods fit in [a, b]" is meaningless once the interval
+        # itself is unbounded - span/period is infinite, so num_periods
+        # would be infinite too (an infinite loop's worth of periods, not a
+        # real count), rather than the sympy exception this used to rely on
+        # to bail out safely.
+        return None
+
     try:
         period = periodicity(expr, var)
     except Exception:

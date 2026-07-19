@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.database import init_db
-from app.routers import solver, questions, collections, auth, upload
+from app.routers import auth, collections, questions, solver, upload
 
 settings = get_settings()
 
@@ -31,6 +31,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Register routers
 app.include_router(solver.router)
 app.include_router(questions.router)
 app.include_router(collections.router)
@@ -38,6 +39,32 @@ app.include_router(auth.router)
 app.include_router(upload.router)
 
 
-@app.get("/health")
+@app.get("/", tags=["Root"])
+async def root():
+    return {
+        "message": "Welcome to the Calculus Solver & Checker API",
+        "version": app.version,
+        "docs": "/docs",
+        "redoc": "/redoc",
+        "health": "/health",
+    }
+
+
+@app.get("/health", tags=["System"])
 async def health():
-    return {"status": "ok", "app": settings.APP_NAME}
+    return {
+        "status": "ok",
+        "app": settings.APP_NAME,
+        "version": app.version,
+    }
+
+
+@app.get("/api", tags=["System"])
+async def api_info():
+    return {
+        "name": settings.APP_NAME,
+        "version": app.version,
+        "description": app.description,
+        "documentation": "/docs",
+        "redoc": "/redoc",
+    }

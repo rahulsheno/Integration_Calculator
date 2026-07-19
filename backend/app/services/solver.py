@@ -30,6 +30,19 @@ from app.services.series_engine import try_solve_series, try_solve_continued_fra
 from app.services.pattern_matcher import try_symmetry_substitution, try_periodicity_reduction, classify_named_pattern
 from app.services.verification import numerical_verify, numeric_quad as _numeric_quad
 
+try:
+    # Reuse the same LaTeX->plain-expression conversion already used for
+    # OCR'd images (see app/services/math_ocr.py), so that a user who
+    # pastes raw LaTeX directly into the "Enter a calculus problem" box
+    # (e.g. "\int e^{x}\cdot\sinh(x)\,dx") gets the same treatment instead
+    # of failing outright - normalize_expression() only handles the
+    # solver's own plain-text grammar ("integrate ... dx"), not LaTeX
+    # commands, so raw LaTeX previously passed straight through unconverted
+    # and every downstream parse attempt failed.
+    from app.services.math_ocr import normalize_latex_math as _normalize_latex_math
+except ImportError:
+    _normalize_latex_math = None
+
 from app.schemas.schemas import (
     SolveRequest, SolveResponse, StepDetail, AlternativeMethod,
     FormulaUsed, GraphData, MathContext, VerifyRequest, VerifyResponse, VerificationStep
@@ -527,6 +540,46 @@ def _frac_antiderivative(var):
     return sp.floor(var) / 2 + (var - sp.floor(var)) ** 2 / 2
 
 
+_HALF_ANGLE_U = sp.Wild("u_half_angle", exclude=[0])
+
+# (pattern, replacement) pairs implementing the half-angle identities
+# 1+cos(u) = 2cos^2(u/2), 1-cos(u) = 2sin^2(u/2), cosh(u)+1 = 2cosh^2(u/2),
+# cosh(u)-1 = 2sinh^2(u/2). Order doesn't matter for the cosh(u)+1 case
+# specifically (sympy's Add is commutative/canonical, so "1+cosh(u)" and
+# "cosh(u)+1" are literally the same object), but is listed both ways for
+# clarity. cosh(u)+1 is always >= 0 so needs no Abs; the others can be
+# negative depending on u's sign, so keep the Abs and let the existing
+# Abs/Piecewise handling below have a shot at them.
+_HALF_ANGLE_SQRT_REWRITES = (
+    (sp.sqrt(1 + sp.cosh(_HALF_ANGLE_U)), sp.sqrt(2) * sp.cosh(_HALF_ANGLE_U / 2)),
+    (sp.sqrt(sp.cosh(_HALF_ANGLE_U) - 1), sp.sqrt(2) * sp.Abs(sp.sinh(_HALF_ANGLE_U / 2))),
+    (sp.sqrt(1 + sp.cos(_HALF_ANGLE_U)), sp.sqrt(2) * sp.Abs(sp.cos(_HALF_ANGLE_U / 2))),
+    (sp.sqrt(1 - sp.cos(_HALF_ANGLE_U)), sp.sqrt(2) * sp.Abs(sp.sin(_HALF_ANGLE_U / 2))),
+)
+
+
+def _rewrite_sqrt_half_angle(expr):
+    """Collapse sqrt(1 ± cos(u)) / sqrt(cosh(u) ± 1) using the half-angle
+    identities before integration is attempted.
+
+    Left as a bare sqrt of a trig/hyperbolic sum, sympy's integrate()
+    generally can't find a closed form at all and silently falls back to
+    an unevaluated Integral - e.g. sqrt(1+cosh(x)) really is just
+    sqrt(2)*cosh(x/2), but sympy has no way to notice that on its own
+    since it never tries this substitution. Rewriting to the equivalent,
+    much simpler form upfront (still exactly equal, not an approximation)
+    gives integrate() something it can actually solve.
+    """
+    if expr is None:
+        return expr
+    try:
+        for pattern, replacement in _HALF_ANGLE_SQRT_REWRITES:
+            expr = expr.replace(pattern, replacement)
+    except Exception:
+        pass
+    return expr
+
+
 def _rewrite_for_integration(expr):
     """Rewrite Abs/Max/Min nodes into Piecewise before integration.
 
@@ -538,6 +591,7 @@ def _rewrite_for_integration(expr):
     """
     if expr is None:
         return expr
+    expr = _rewrite_sqrt_half_angle(expr)
     try:
         if expr.has(sp.Abs, sp.Max, sp.Min):
             return expr.rewrite(sp.Piecewise)
@@ -1113,6 +1167,85 @@ def _integrate_definite_with_fallbacks(expr, x_symbol, lower_val, upper_val):
     return result, None
 
 
+_HYPERBOLIC_SECANT_SQRT_K = sp.Wild("k_hyp_sqrt", exclude=[0])
+_HYPERBOLIC_SECANT_SQRT_PATTERN = 1 / (
+    sp.cosh(_HYPERBOLIC_SECANT_SQRT_K * sp.Symbol("__hyp_sqrt_x"))
+    * sp.sqrt(sp.cosh(2 * _HYPERBOLIC_SECANT_SQRT_K * sp.Symbol("__hyp_sqrt_x")))
+)
+
+
+def _try_hyperbolic_secant_sqrt_antiderivative(expr, x_symbol):
+    """Recognize integrands of the form 1/(cosh(kx)*sqrt(cosh(2kx))) and
+    return their closed-form antiderivative directly.
+
+    This family has an exact elementary antiderivative
+    (arctanh(sinh(kx)/sqrt(cosh(2kx)))/k - verified by direct
+    differentiation), reachable by hand via the substitution u=sinh(kx)
+    followed by a trig substitution u=(1/sqrt(2))tan(t). sympy's
+    Risch-based integrate() has no way to discover that two-step
+    substitution chain on its own and just returns the integral
+    unevaluated, so this matches the pattern directly rather than relying
+    on general-purpose symbolic integration for it.
+    """
+    pattern = _HYPERBOLIC_SECANT_SQRT_PATTERN.subs(sp.Symbol("__hyp_sqrt_x"), x_symbol)
+    try:
+        match = expr.match(pattern)
+    except Exception:
+        return None
+    if not match:
+        return None
+    k_val = match.get(_HYPERBOLIC_SECANT_SQRT_K)
+    if k_val is None or k_val == 0:
+        return None
+    return sp.atanh(sp.sinh(k_val * x_symbol) / sp.sqrt(sp.cosh(2 * k_val * x_symbol))) / k_val
+
+
+_EXP_SINH_LOG_COSH_K = sp.Wild("k_exp_sinh_log_cosh", exclude=[0])
+
+
+def _try_exp_sinh_log_cosh_antiderivative(expr, x_symbol):
+    """Recognize integrands of the form exp(kx)*sinh(kx)*ln(cosh(kx)) and
+    return their closed-form antiderivative in terms of the dilogarithm.
+
+    sympy's integrate() returns this family unevaluated - not because it
+    lacks a closed form, but because that closed form isn't elementary (it
+    needs Li_2, the dilogarithm), which is outside what integrate()'s
+    default strategies search for. Worked out by hand via e^x*sinh(x) =
+    (e^{2x}-1)/2, then integration by parts with u=ln(cosh(x)), reducing
+    the remainder to a standard ∫x*tanh(x)dx integral solvable via
+    tanh(x) = 1 - 2/(e^{2x}+1) and the dilogarithm identity
+    ∫ln(1+t)/t dt = -Li_2(-t). Verified independently here by direct
+    differentiation (both symbolically and numerically, including negative
+    x and general k) rather than trusting the derivation alone.
+    """
+    pattern = (
+        sp.exp(_EXP_SINH_LOG_COSH_K * x_symbol)
+        * sp.sinh(_EXP_SINH_LOG_COSH_K * x_symbol)
+        * sp.log(sp.cosh(_EXP_SINH_LOG_COSH_K * x_symbol))
+    )
+    try:
+        match = expr.match(pattern)
+    except Exception:
+        return None
+    if not match:
+        return None
+    k_val = match.get(_EXP_SINH_LOG_COSH_K)
+    if k_val is None or k_val == 0:
+        return None
+
+    t = k_val * x_symbol
+    antideriv_in_t = (
+        sp.Rational(1, 4) * (sp.exp(2 * t) + 1) * sp.log(sp.cosh(t))
+        - sp.exp(2 * t) / 8
+        - t ** 2 / 4
+        + t / 4
+        + (t * sp.log(2)) / 2
+        + sp.log(2) / 4
+        - sp.polylog(2, -sp.exp(-2 * t)) / 4
+    )
+    return antideriv_in_t / k_val
+
+
 def _try_frac_fast_path(expr, x_symbol, lower_val, upper_val):
     """If expr is exactly frac(x) = x - floor(x), evaluate the definite
     integral via the closed-form antiderivative in _frac_antiderivative,
@@ -1166,6 +1299,16 @@ def _try_wallis_fast_path(expr, x_symbol, lower_val, upper_val):
 
 def solve_calculus(request: SolveRequest) -> SolveResponse:
     expression = normalize_expression(request.expression)
+
+    if "\\" in expression and _normalize_latex_math is not None:
+        # normalize_expression() only understands this solver's own
+        # plain-text grammar; a literal backslash surviving that call means
+        # the input was raw LaTeX it didn't touch (e.g. "\int ... \,dx"),
+        # not a genuine parse failure. Route it through the same
+        # LaTeX->plain conversion the OCR path uses before giving up on it.
+        latex_expression = _normalize_latex_math(expression)
+        if latex_expression:
+            expression = latex_expression
 
     depth_error = check_nesting_depth(expression)
     if depth_error:
@@ -1792,21 +1935,60 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
                     justification=f"Detected technique: {technique}. This is the most efficient approach for this type of integrand."
                 ))
 
-                try:
-                    if sp.simplify(expr - (x - sp.floor(x))) == 0:
-                        result = _frac_antiderivative(x)
-                    else:
-                        result = integrate(simplify(expr), x)
-                except Exception:
+                hyperbolic_result = _try_hyperbolic_secant_sqrt_antiderivative(expr, x)
+                exp_sinh_log_cosh_result = _try_exp_sinh_log_cosh_antiderivative(expr, x)
+                if hyperbolic_result is not None:
+                    result = hyperbolic_result
+                elif exp_sinh_log_cosh_result is not None:
+                    result = exp_sinh_log_cosh_result
+                else:
                     try:
-                        result = integrate(expr, x)
+                        if sp.simplify(expr - (x - sp.floor(x))) == 0:
+                            result = _frac_antiderivative(x)
+                        else:
+                            result = integrate(simplify(expr), x)
                     except Exception:
                         try:
-                            result = integrate(expr, x, risch=False)
+                            result = integrate(expr, x)
                         except Exception:
-                            result = sp.Integral(expr, x)
+                            try:
+                                result = integrate(expr, x, risch=False)
+                            except Exception:
+                                result = sp.Integral(expr, x)
 
                 simplified = _best_simplify(result)
+
+                if _is_unresolved(simplified):
+                    # One more attempt with sympy's pattern-matching ("manual")
+                    # integrator, which sometimes succeeds where the default
+                    # Risch/Meijer-G-based approach doesn't.
+                    try:
+                        alt_result = integrate(expr, x, manual=True)
+                    except Exception:
+                        alt_result = None
+                    if alt_result is not None and not _is_unresolved(alt_result):
+                        result = alt_result
+                        simplified = _best_simplify(result)
+
+                if _is_unresolved(simplified):
+                    # sympy genuinely couldn't find a closed form - it just
+                    # handed back Integral(expr, x) unevaluated. Showing that
+                    # dressed up as "answer + C" (as this used to do) isn't a
+                    # solved integral, and the "verification" step that
+                    # differentiates it to reproduce the integrand is
+                    # tautologically true for *any* unevaluated integral, so
+                    # it can't actually confirm anything was solved. Report
+                    # the failure honestly instead.
+                    return _with_math_context(
+                        _fallback_response(
+                            expression, topic, confidence,
+                            "Couldn't find a closed-form antiderivative for this integrand. "
+                            "Sympy's symbolic integration returned it unevaluated, so no answer "
+                            "is reported rather than presenting the unsolved integral as a result.",
+                        ),
+                        expression, parsed, request.session_id,
+                    )
+
                 verify_ctx = {"kind": "indefinite_integral", "expr": expr, "var": x, "antideriv": simplified}
 
                 steps.append(StepDetail(

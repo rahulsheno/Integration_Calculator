@@ -15,6 +15,20 @@ never sympy objects - actual symbolic evaluation still happens in solver.py.
 
 import re
 
+try:
+    # The rewrites in this module (superscripts, function powers, "|x|",
+    # "{x}") all assume plain, ASCII-ish math text. Raw LaTeX - pasted
+    # directly into the "Enter a calculus problem" box, or left
+    # unconverted by an upstream OCR call - needs a completely different
+    # conversion path, since commands like \int, \frac, \cdot, \left/\right
+    # have no meaning to the rewrites below and previously passed straight
+    # through untouched, causing every downstream parse attempt to fail.
+    # Reuse the LaTeX->plain converter already used for OCR'd images
+    # instead of duplicating that logic here.
+    from app.services.math_ocr import normalize_latex_math as _normalize_latex_math
+except ImportError:
+    _normalize_latex_math = None
+
 _SUPERSCRIPT_MAP = {
     "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
     "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
@@ -179,6 +193,18 @@ def normalize_expression(text: str) -> str:
     """
     if not text:
         return text
+
+    if "\\" in text and _normalize_latex_math is not None:
+        # A literal backslash is a reliable signal this is raw LaTeX
+        # rather than the plain-text grammar the rewrites below expect.
+        # Convert it via the shared LaTeX converter first; if that
+        # succeeds, use its output. If it comes back empty (couldn't make
+        # sense of the input either), fall through and let the rewrites
+        # below run on the original text unchanged - matching prior
+        # behavior of failing cleanly rather than fabricating a result.
+        latex_result = _normalize_latex_math(text)
+        if latex_result:
+            text = latex_result
 
     for src, dst in _UNICODE_REPLACEMENTS.items():
         text = text.replace(src, dst)

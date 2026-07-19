@@ -244,10 +244,99 @@ def parse_expression(expr_str: str):
     return "expression", expr_str
 
 
+_POWER_NOTATION_FUNCS = sorted(
+    (
+        "arcsin", "arccos", "arctan",
+        "asinh", "acosh", "atanh",
+        "sinh", "cosh", "tanh", "coth", "sech", "csch",
+        "sin", "cos", "tan", "cot", "sec", "csc",
+        "log", "ln", "exp",
+    ),
+    key=len,
+    reverse=True,
+)
+
+_POWER_NOTATION_FUNC_RE = re.compile(r"(" + "|".join(_POWER_NOTATION_FUNCS) + r")\^")
+
+
+def _consume_balanced_parens(text: str, pos: int) -> tuple[str | None, int]:
+    """Consume a balanced (...) group starting at `pos`. Returns (inner
+    text, index just past the closing paren), or (None, pos) if `pos`
+    isn't the start of a balanced group."""
+    if pos >= len(text) or text[pos] != "(":
+        return None, pos
+    depth = 0
+    for j in range(pos, len(text)):
+        if text[j] == "(":
+            depth += 1
+        elif text[j] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[pos + 1:j], j + 1
+    return None, pos
+
+
+def _rewrite_function_power_notation(text: str) -> str:
+    """Rewrite "FUNC^n(arg)" / "FUNC^(n)(arg)" (n and arg may each be a
+    plain token or a parenthesized, possibly-nested group) into the
+    unambiguous "FUNC(arg)^(n)".
+
+    Textbook/handwritten-style input like "cos^2(x)" is extremely common,
+    but after the "^" -> "**" substitution below it becomes "cos**2(x)",
+    which sympy's implicit-multiplication parser doesn't read as
+    "cos(x)**2" - instead it silently mis-associates the power and the
+    call, and for nested trig (e.g. "cos^2((pi/2)cos^2(x))") this produces
+    a plausible-looking but mathematically wrong expression rather than a
+    parse error, so it isn't caught anywhere downstream. Rewriting to the
+    unambiguous "FUNC(arg)^(n)" form up front, before ^ is ever replaced,
+    fixes this at the source. Recurses into `arg` so nested occurrences
+    (as in the example above) are fixed too, innermost first.
+    """
+    result: list[str] = []
+    i = 0
+    while i < len(text):
+        m = _POWER_NOTATION_FUNC_RE.match(text, i)
+        if not m:
+            result.append(text[i])
+            i += 1
+            continue
+
+        func_name = m.group(1)
+        pos = m.end()
+
+        if pos < len(text) and text[pos] == "(":
+            exponent, pos = _consume_balanced_parens(text, pos)
+        else:
+            tok_match = re.match(r"-?\d+(?:\.\d+)?", text[pos:])
+            exponent = tok_match.group(0) if tok_match else None
+            pos = pos + len(exponent) if exponent else pos
+        if exponent is None:
+            result.append(text[i])
+            i += 1
+            continue
+
+        if pos < len(text) and text[pos] == "(":
+            arg, new_pos = _consume_balanced_parens(text, pos)
+        else:
+            tok_match = re.match(r"[a-zA-Z0-9_.]+", text[pos:])
+            arg = tok_match.group(0) if tok_match else None
+            new_pos = pos + len(arg) if arg else pos
+        if arg is None:
+            result.append(text[i])
+            i += 1
+            continue
+
+        arg_processed = _rewrite_function_power_notation(arg)
+        result.append(f"{func_name}({arg_processed})^({exponent})")
+        i = new_pos
+    return "".join(result)
+
+
 def safe_sympify(expr_str: str):
     """Safely convert string to sympy expression with common replacements."""
     try:
         # Clean up the string
+        expr_str = _rewrite_function_power_notation(expr_str)
         expr_str = expr_str.replace('^', '**')
         local_dict = {
             'x': symbols('x'), 'y': symbols('y'), 'z': symbols('z'),

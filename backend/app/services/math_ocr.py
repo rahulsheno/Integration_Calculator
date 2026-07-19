@@ -487,6 +487,12 @@ _KNOWN_MATH_WORDS = {
     "sinh", "cosh", "tanh", "coth", "sech", "csch",
     "asinh", "acosh", "atanh", "acoth", "asech", "acsch",
     "sqrt", "log", "ln", "exp", "pi",
+    # sympy's own printed token for infinity (str(sympy.oo) == "oo"), which
+    # is exactly what latex2sympy2 converts \infty to. Without this, any
+    # expression or integral bound involving infinity looks identical to
+    # an untranslated LaTeX leftover and gets rejected, even though "oo"
+    # is precisely what the solver's own parser expects.
+    "oo",
     # scaffolding words this module itself generates, e.g. "integrate x+1 dx
     # from 0 to 1" - these must never be flagged as untranslated LaTeX.
     "integrate", "from", "to",
@@ -513,11 +519,15 @@ def _has_untranslated_latex_artifacts(expression: str) -> bool:
     # but are a very common OCR misread of a digit (e.g. "0" -> "D" or
     # "O", "5" -> "S") - exactly what turned "2026" into "2D/6" in one
     # real case. The variables this solver actually recognizes are all
-    # lowercase (x, y, z, t, u, v, n); "I" (imaginary unit) is the sole
-    # legitimate standalone uppercase letter, so anything else isolated
-    # is treated as a probable misread rather than an intentional symbol.
+    # lowercase (x, y, z, t, u, v, n); "I" (imaginary unit) and "E"
+    # (Euler's number) are the sole legitimate standalone uppercase
+    # letters, so anything else isolated is treated as a probable misread
+    # rather than an intentional symbol. "E" specifically shows up because
+    # latex2sympy2 prints \ln(...) as the two-argument form log(arg, E)
+    # rather than bare log(arg) - without this exception, every natural
+    # log gets its otherwise-correct conversion thrown away right here.
     for letter in re.findall(r"(?<![a-zA-Z])[A-Z](?![a-zA-Z])", expression):
-        if letter != "I":
+        if letter not in ("I", "E"):
             return True
     return False
 

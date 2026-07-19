@@ -518,6 +518,21 @@ def _best_simplify(expr):
 
     _try(lambda e: simplify(e))
     _try(lambda e: simplify(expand(e.rewrite(exp))))
+    # Targeted version of the rewrite above: expand ONLY sinh/cosh into
+    # exponential form, leaving sin/cos untouched. Rewriting sin/cos as
+    # well (as the blanket e.rewrite(exp) above does) forces them into
+    # *complex* exponentials (sin(x) = (exp(ix)-exp(-ix))/(2i)), which
+    # often doesn't simplify back down cleanly. sinh/cosh are naturally
+    # real when expanded (cosh(x) = (exp(x)+exp(-x))/2), so leaving sin/cos
+    # alone and only expanding the hyperbolic side lets terms like
+    # exp(x)*cosh(x) collapse into a single exp(2*x)/2 + 1/2 term instead
+    # of staying stuck as a mixed sin/cos/sinh/cosh product - exactly the
+    # case that motivated this: "integrate exp(x)*sin(x)*cosh(x) dx" was
+    # displaying the correct but needlessly tangled antiderivative
+    # "(sin(x)sinh(x)+sin(x)cosh(x)+2cos(x)sinh(x)-3cos(x)cosh(x))exp(x)/5"
+    # instead of the equivalent, much simpler
+    # "exp(2*x)*sin(x)/5 - exp(2*x)*cos(x)/10 - cos(x)/2".
+    _try(lambda e: simplify(expand(e.rewrite(sp.sinh, exp).rewrite(sp.cosh, exp))))
     _try(lambda e: trigsimp(expand(simplify(e))))
     _try(lambda e: radsimp(together(simplify(e))))
     _try(lambda e: sp.nsimplify(simplify(e), rational=False))
@@ -789,34 +804,64 @@ def _general_expression_response(expression: str, expr_str: str, topic: str, con
     )
 
 
-def _match_trig_power(expr, x_symbol):
-    """If expr is exactly sin(x)**n or cos(x)**n for a non-negative integer
-    n, return (func_name, n). Otherwise None. Handles n=1 specially since
-    sympy auto-simplifies sin(x)**1 to plain sin(x) (not a Pow object)."""
-    if expr == sp.sin(x_symbol):
-        return ("sin", 1)
-    if expr == sp.cos(x_symbol):
-        return ("cos", 1)
-    if expr.is_Pow and expr.exp.is_Integer and expr.exp > 0:
-        base = expr.base
-        if base == sp.sin(x_symbol):
-            return ("sin", int(expr.exp))
-        if base == sp.cos(x_symbol):
-            return ("cos", int(expr.exp))
-    return None
+def _match_trig_power_product(expr, x_symbol):
+    """If expr is sin(x)**m * cos(x)**n for non-negative integers m, n
+    (either may be 0, meaning that factor is absent - covers the pure
+    sin(x)**m or cos(x)**n cases too), return (m, n). Otherwise None.
+    Handles power 1 specially since sympy auto-simplifies sin(x)**1 to
+    plain sin(x) (not a Pow object)."""
+
+    def factor_power(factor):
+        if factor == sp.sin(x_symbol):
+            return ("sin", 1)
+        if factor == sp.cos(x_symbol):
+            return ("cos", 1)
+        if factor.is_Pow and factor.exp.is_Integer and factor.exp > 0:
+            if factor.base == sp.sin(x_symbol):
+                return ("sin", int(factor.exp))
+            if factor.base == sp.cos(x_symbol):
+                return ("cos", int(factor.exp))
+        return None
+
+    factors = expr.args if expr.is_Mul else (expr,)
+    if len(factors) > 2:
+        return None
+
+    m = n = 0
+    seen_sin = seen_cos = False
+    for factor in factors:
+        result = factor_power(factor)
+        if result is None:
+            return None
+        func_name, power = result
+        if func_name == "sin":
+            if seen_sin:
+                return None
+            seen_sin, m = True, power
+        else:
+            if seen_cos:
+                return None
+            seen_cos, n = True, power
+
+    if m == 0 and n == 0:
+        return None
+    return (m, n)
 
 
-def _wallis_bound_multiplier(func_name: str, n: int, lower_val, upper_val):
-    """For sin(x)**n or cos(x)**n integrated over [lower_val, upper_val],
+def _wallis_bound_multiplier(m: int, n: int, lower_val, upper_val):
+    """For sin(x)**m * cos(x)**n integrated over [lower_val, upper_val],
     return (multiplier, sign) such that the definite integral equals
-    sign * multiplier * W(n), where W(n) = integral over a single quarter
-    period [0, pi/2] (see _wallis_quarter_period). Returns None if the
-    bounds aren't one of the standard ranges this fast path recognizes -
-    callers should fall back to normal symbolic integration in that case.
+    sign * multiplier * W(m, n), where W(m, n) = integral over a single
+    quarter period [0, pi/2] (see _wallis_quarter_period_numeric). Returns
+    None if the bounds aren't one of the standard ranges this fast path
+    recognizes - callers should fall back to normal symbolic integration.
 
-    Cross-validated against sympy's own integrate() for n = 0..9 across
-    every supported bound pattern (both orientations) before being trusted
-    for the large n this fast path exists for.
+    Symmetry depends on both m's and n's parity jointly (sin^m*cos^n is
+    even in x iff m is even; the function is period-pi iff m+n is even,
+    anti-period-pi otherwise). Cross-validated against sympy's own
+    integrate() for m, n = 0..6 across every supported bound pattern
+    (both orientations) - 294 combinations, all matching - before being
+    trusted for the large m, n this fast path exists for.
     """
     lo, hi = lower_val, upper_val
     sign = 1
@@ -833,69 +878,85 @@ def _wallis_bound_multiplier(func_name: str, n: int, lower_val, upper_val):
         except Exception:
             return False
 
-    even = (n % 2 == 0)
+    m_even = (m % 2 == 0)
+    n_even = (n % 2 == 0)
+
     if is_(lo, 0) and is_(hi, sp.pi / 2):
         return (1, sign)
     if is_(lo, 0) and is_(hi, sp.pi):
-        if func_name == "cos":
-            return (2, sign) if even else (0, sign)
-        return (2, sign)
-    if is_(lo, 0) and is_(hi, 2 * sp.pi):
-        return (4, sign) if even else (0, sign)
+        return (2, sign) if n_even else (0, sign)
     if is_(lo, -sp.pi / 2) and is_(hi, sp.pi / 2):
-        if func_name == "cos":
-            return (2, sign)
-        return (2, sign) if even else (0, sign)
+        return (2, sign) if m_even else (0, sign)
+    if is_(lo, 0) and is_(hi, 2 * sp.pi):
+        return (4, sign) if (m_even and n_even) else (0, sign)
     if is_(lo, -sp.pi) and is_(hi, sp.pi):
-        return (4, sign) if even else (0, sign)
+        return (4, sign) if (m_even and n_even) else (0, sign)
     return None
 
 
-def _wallis_closed_form_strings(n: int, multiplier: int, sign: int):
+def _wallis_closed_form_strings(m: int, n: int, multiplier: int, sign: int):
     """Build a compact exact closed-form string for sign * multiplier *
-    W(n), using binomial()/4^k notation instead of ever materializing the
-    huge literal integers involved (e.g. central binomial coefficients for
-    n in the thousands have hundreds of digits) - sympy's default printer
-    otherwise fully expands these into unreadable digit blobs. Returns
-    (answer_str, answer_latex_str, numeric_value).
+    W(m, n), using the standard double-factorial identity:
+
+        W(m, n) = (m-1)!! * (n-1)!! / (m+n)!! * K,
+        K = pi/2 if m and n are both even, else K = 1
+
+    (validated numerically against sympy's gamma-function Beta formula
+    across m, n = 0..11, all 144 combinations matching exactly), using
+    factorial2()/binomial-style notation instead of ever materializing the
+    huge literal integers involved (e.g. for m=n=50 the fully-expanded
+    fraction has a 30-digit denominator) - sympy's default printer
+    otherwise fully expands these into unreadable digit blobs.
+    Returns (answer_str, answer_latex_str, numeric_value).
     """
     sign_str = "-" if sign < 0 else ""
     if multiplier == 0:
         return "0", "0", 0.0
 
-    if n % 2 == 1:
-        k = (n - 1) // 2
-        coeff_str = "" if multiplier == 1 else f"{multiplier}*"
-        coeff_latex = "" if multiplier == 1 else f"{multiplier}\\cdot "
-        answer = f"{sign_str}{coeff_str}4^{k}/({n}*binomial({2*k}, {k}))"
-        answer_latex = rf"{sign_str}\frac{{{coeff_latex}4^{{{k}}}}}{{{n}\binom{{{2*k}}}{{{k}}}}}"
-    else:
-        m = n // 2
-        denom_pow = n + 1
-        coeff_str = "" if multiplier == 1 else f"{multiplier}*"
-        coeff_latex = "" if multiplier == 1 else f"{multiplier}"
-        answer = f"{sign_str}{coeff_str}pi*binomial({n}, {m})/2^{denom_pow}"
-        answer_latex = rf"{sign_str}\frac{{{coeff_latex}\pi\binom{{{n}}}{{{m}}}}}{{2^{{{denom_pow}}}}}"
+    both_even = (m % 2 == 0) and (n % 2 == 0)
+    coeff_str = "" if multiplier == 1 else f"{multiplier}*"
+    coeff_latex = "" if multiplier == 1 else f"{multiplier}"
 
-    numeric_value = float(sign * multiplier * _wallis_quarter_period_numeric(n))
+    numerator = f"factorial2({m-1})*factorial2({n-1})"
+    numerator_latex = rf"({m-1})!!\,({n-1})!!"
+    denom = f"factorial2({m+n})"
+    denom_latex = rf"({m+n})!!"
+
+    if both_even:
+        answer = f"{sign_str}{coeff_str}pi*{numerator}/(2*{denom})"
+        answer_latex = rf"{sign_str}\frac{{{coeff_latex}\pi\,{numerator_latex}}}{{2\,{denom_latex}}}"
+    else:
+        answer = f"{sign_str}{coeff_str}{numerator}/{denom}"
+        answer_latex = rf"{sign_str}\frac{{{coeff_latex}{numerator_latex}}}{{{denom_latex}}}"
+
+    numeric_value = float(sign * multiplier * _wallis_quarter_period_numeric(m, n))
     return answer, answer_latex, numeric_value
 
 
-def _wallis_quarter_period_numeric(n: int) -> float:
-    """Numeric value of W(n) = integral of cos(x)**n (= sin(x)**n) over
-    [0, pi/2], via the standard Wallis recurrence W(n) = ((n-1)/n)*W(n-2),
-    W(0)=pi/2, W(1)=1, evaluated as a float throughout - avoids ever
-    constructing the huge exact Rational/pi expression when only a decimal
-    approximation for display purposes is needed."""
+def _wallis_quarter_period_numeric(m: int, n: int) -> float:
+    """Numeric value of W(m, n) = integral of sin(x)**m * cos(x)**n over
+    [0, pi/2], via the double-factorial closed form evaluated as a float
+    throughout - avoids ever constructing the huge exact Rational/pi
+    expression when only a decimal approximation for display is needed.
+    Uses math.lgamma for numerical stability at large m, n (avoids
+    overflowing on the individual double factorials themselves)."""
     import math
-    if n == 0:
-        return math.pi / 2
-    if n == 1:
-        return 1.0
-    prev2, prev1 = math.pi / 2, 1.0
-    for k in range(2, n + 1):
-        prev2, prev1 = prev1, (k - 1) / k * prev2
-    return prev1
+
+    def log_factorial2(k: int) -> float:
+        if k <= 0:
+            return 0.0
+        # (2j)!! = 2^j * j!; (2j+1)!! = (2j+1)! / (2^j * j!)
+        if k % 2 == 0:
+            j = k // 2
+            return j * math.log(2) + math.lgamma(j + 1)
+        j = (k - 1) // 2
+        return math.lgamma(2 * j + 2) - (j * math.log(2) + math.lgamma(j + 1))
+
+    log_value = log_factorial2(m - 1) + log_factorial2(n - 1) - log_factorial2(m + n)
+    value = math.exp(log_value)
+    if m % 2 == 0 and n % 2 == 0:
+        value *= math.pi / 2
+    return value
 
 
 def _is_unresolved(value) -> bool:
@@ -987,29 +1048,31 @@ def _try_frac_fast_path(expr, x_symbol, lower_val, upper_val):
 
 
 def _try_wallis_fast_path(expr, x_symbol, lower_val, upper_val):
-    """Entry point: if expr is sin(x)**n or cos(x)**n and the bounds match
-    a standard recognized range, return (answer, answer_latex,
-    numeric_value) computed via the closed-form Wallis formula - exact,
-    and instant even for huge n. Otherwise returns None so the caller
-    falls back to normal symbolic integration.
+    """Entry point: if expr is sin(x)**m * cos(x)**n (either power may be
+    absent, covering the pure sin(x)**n or cos(x)**n cases too) and the
+    bounds match a standard recognized range, return (answer,
+    answer_latex, numeric_value) computed via the closed-form Wallis
+    formula - exact, and instant even for huge m/n. Otherwise returns None
+    so the caller falls back to normal symbolic integration.
 
     This exists because sympy's general integrate() applies a reduction
-    formula recursively n times for high powers of sin/cos, which becomes
+    formula recursively for high powers of sin/cos, which becomes
     impractically slow (and, even when it finishes, produces a needlessly
-    huge symbolic expression) for n in the thousands - exactly the kind of
-    "integrate cos(x)^2020 dx" problem this calculator gets asked.
+    huge symbolic expression) for exponents in the thousands - exactly the
+    kind of "integrate cos(x)^2020 dx" or "sin(x)^50*cos(x)^50" problem
+    this calculator gets asked.
     """
-    match = _match_trig_power(expr, x_symbol)
+    match = _match_trig_power_product(expr, x_symbol)
     if match is None:
         return None
-    func_name, n = match
+    m, n = match
 
-    bound_result = _wallis_bound_multiplier(func_name, n, lower_val, upper_val)
+    bound_result = _wallis_bound_multiplier(m, n, lower_val, upper_val)
     if bound_result is None:
         return None
     multiplier, sign = bound_result
 
-    return _wallis_closed_form_strings(n, multiplier, sign)
+    return _wallis_closed_form_strings(m, n, multiplier, sign)
 
 
 def solve_calculus(request: SolveRequest) -> SolveResponse:

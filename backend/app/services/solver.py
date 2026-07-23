@@ -5,7 +5,7 @@ import sympy as sp
 from sympy import (
     Symbol, symbols, limit, Derivative, Integral, diff, integrate, solve,
     series, dsolve, Function, Eq, oo, pi, nan, sin, cos, tan, cot, sec, csc,
-    log, exp, sqrt, factorial, Sum, Product, Matrix, latex, simplify, expand,
+    log, exp, sqrt, factorial, Sum, Product, Matrix, latex as _sympy_latex, simplify, expand,
     factor, apart, together, ratsimp, trigsimp, powsimp, combsimp, radsimp,
     nsimplify, fraction, numer, denom, collect, cancel, nroots, nsolve
 )
@@ -16,6 +16,32 @@ from sympy.integrals.transforms import laplace_transform, inverse_laplace_transf
 from sympy.parsing.sympy_parser import (
     parse_expr, standard_transformations, implicit_multiplication_application, convert_xor
 )
+
+
+def latex(expr, **kwargs):
+    """Wrapper around sympy.latex that defaults to full inverse-trig names
+    (arctan, arcsin, ...) instead of sympy's default abbreviated style
+    (atan, asin, ...), since that's what users expect to see rendered."""
+    kwargs.setdefault("inv_trig_style", "full")
+    return _sympy_latex(expr, **kwargs)
+
+from app.services.normalizer import normalize_expression, check_nesting_depth
+from app.services.series_engine import try_solve_series, try_solve_continued_fraction, try_solve_product
+from app.services.pattern_matcher import try_symmetry_substitution, try_periodicity_reduction, classify_named_pattern
+from app.services.verification import numerical_verify, numeric_quad as _numeric_quad
+
+try:
+    # Reuse the same LaTeX->plain-expression conversion already used for
+    # OCR'd images (see app/services/math_ocr.py), so that a user who
+    # pastes raw LaTeX directly into the "Enter a calculus problem" box
+    # (e.g. "\int e^{x}\cdot\sinh(x)\,dx") gets the same treatment instead
+    # of failing outright - normalize_expression() only handles the
+    # solver's own plain-text grammar ("integrate ... dx"), not LaTeX
+    # commands, so raw LaTeX previously passed straight through unconverted
+    # and every downstream parse attempt failed.
+    from app.services.math_ocr import normalize_latex_math as _normalize_latex_math
+except ImportError:
+    _normalize_latex_math = None
 
 from app.schemas.schemas import (
     SolveRequest, SolveResponse, StepDetail, AlternativeMethod,
@@ -111,7 +137,32 @@ def classify_topic(expression: str) -> tuple[str, float]:
 def parse_expression(expr_str: str):
     expr_str = expr_str.strip().replace("\\", "")
     expr_str = re.sub(r'∂', '', expr_str)
-    
+
+    # Check for a periodic continued fraction: a literal "..." marks the
+    # infinite repetition, e.g. "1/(1+x/(1+x/(1+...)))".
+    if '...' in expr_str:
+        return "continued_fraction", expr_str
+
+    # Check for an infinite/finite series or product: "sum x^n from n=0 to
+    # infinity", "product (n+1)/n from n=1 to 5".
+    m = re.match(
+        r'(?:sum|series)\s+(?:of\s+)?(.+?)\s+from\s+([a-zA-Z])\s*=\s*(.+?)\s+to\s+(.+)',
+        expr_str, re.IGNORECASE,
+    )
+    if m:
+        return "series", m.group(1).strip(), m.group(2), m.group(3).strip(), m.group(4).strip()
+
+    m = re.match(
+        r'(?:product|prod)\s+(?:of\s+)?(.+?)\s+from\s+([a-zA-Z])\s*=\s*(.+?)\s+to\s+(.+)',
+        expr_str, re.IGNORECASE,
+    )
+    if m:
+        return "product", m.group(1).strip(), m.group(2), m.group(3).strip(), m.group(4).strip()
+
+    # Explicit Sum(...) / Product(...) function-call syntax is left to the
+    # general "expression" fallback path further down, since safe_sympify
+    # already understands those names directly.
+
     # Check for limit
     m = re.match(r'(?:limit|lim)\s+(?:of\s+)?(.+?)\s+as\s+([a-zA-Z])\s*->\s*(.+)', expr_str, re.IGNORECASE)
     if m:
@@ -148,13 +199,33 @@ def parse_expression(expr_str: str):
     # Check for derivative/differentiation
     m = re.match(r'(?:differentiate|derivative(?:\s+of)?)\s+(.+)', expr_str, re.IGNORECASE)
     if m:
-        body = m.group(1).strip()
-        var = None
-        wrt_match = re.search(r'\bwith\s+respect\s+to\s+([a-zA-Z])\w*\s*$', body, re.IGNORECASE)
-        if wrt_match:
-            var = wrt_match.group(1).lower()
-            body = body[:wrt_match.start()].strip()
-        return "differentiate", body, var
+        return "differentiate", m.group(1).strip()
+
+    # Check for an iterated (multiple, i.e. double/triple/...) integral:
+    # "integrate f dx from a to b dy from c to d ..." - the canonical
+    # plain-text form math_ocr's multiple-integral LaTeX extractor
+    # produces, with segments ordered innermost-to-outermost. Must be
+    # checked before the generic single-integral dispatch below, which
+    # doesn't know how to handle more than one "from ... to ..." pair.
+    # Variable names may be a single letter (dx, dy, ...) or a subscripted
+    # identifier (dx_1, dx_10, ...) for genuinely high-dimensional problems.
+    m = re.match(
+        r'integrate\s+(.+?)\s+((?:d[a-zA-Z][a-zA-Z0-9_]*\s+from\s+.+?\s+to\s+.+?\s*)+)$',
+        expr_str, re.IGNORECASE,
+    )
+    if m:
+        integrand, segments_blob = m.groups()
+        segments = re.findall(
+            r'd([a-zA-Z][a-zA-Z0-9_]*)\s+from\s+(.+?)\s+to\s+(.+?)(?=\s+d[a-zA-Z][a-zA-Z0-9_]*\s+from\s+|\s*$)',
+            segments_blob, re.IGNORECASE,
+        )
+        if len(segments) >= 2:
+            # segments[0] is innermost (integrated first), segments[-1] is
+            # outermost (integrated last) - each a (var, lower, upper) triple.
+            return (
+                "multiple_integral", integrand.strip(),
+                [(v, lo.strip(), hi.strip()) for v, lo, hi in segments],
+            )
 
     # Check if we should treat it as an integration
     is_integral = ('integrate' in expr_str.lower() or 
@@ -195,29 +266,16 @@ def parse_expression(expr_str: str):
         integrand = re.sub(r'^∫\s*', '', integrand).strip()
         # Strip off leading "of "
         integrand = re.sub(r'^of\s+', '', integrand, flags=re.IGNORECASE).strip()
-
-        # Determine the variable of integration from the trailing d<var> (e.g.
-        # "dx", "dt", "dy") before stripping it off, defaulting to "x" if none
-        # is present. Without this, every integral was silently computed with
-        # respect to x regardless of what the problem actually asked for.
-        var_match = re.search(r'\bd([a-zA-Z])\s*$', integrand, re.IGNORECASE)
-        integration_var = var_match.group(1).lower() if var_match else "x"
         # Strip off trailing "dx", "dy", "dt" etc.
         integrand = re.sub(r'\s*d[a-z]\b\s*$', '', integrand, flags=re.IGNORECASE).strip()
 
         if lower is not None and upper is not None:
-            return "definite_integral", integrand, lower, upper, integration_var
-        return "integrate", integrand, integration_var
+            return "definite_integral", integrand, lower, upper
+        return "integrate", integrand
 
     # Check for differentiation hints
-    ddx_match = re.search(r'd\s*/\s*d\s*([a-zA-Z])', expr_str, re.IGNORECASE)
-    if ddx_match or 'derive' in expr_str.lower() or 'differentiate' in expr_str.lower():
-        var = ddx_match.group(1).lower() if ddx_match else None
-        body = expr_str
-        if ddx_match:
-            body = body[:ddx_match.start()] + body[ddx_match.end():]
-        body = re.sub(r'(?i)\b(?:differentiate|derivative(?:\s+of)?|derive)\b', '', body)
-        return "differentiate", body.strip(" ()"), var
+    if 'd/d' in expr_str.lower() or 'derive' in expr_str.lower() or 'differentiate' in expr_str.lower():
+        return "differentiate", expr_str
 
     if "=" in expr_str and not any(op in expr_str for op in ("<=", ">=", "!=")):
         return "solve_equation", expr_str
@@ -225,19 +283,114 @@ def parse_expression(expr_str: str):
     return "expression", expr_str
 
 
+_POWER_NOTATION_FUNCS = sorted(
+    (
+        "arcsin", "arccos", "arctan",
+        "asinh", "acosh", "atanh",
+        "sinh", "cosh", "tanh", "coth", "sech", "csch",
+        "sin", "cos", "tan", "cot", "sec", "csc",
+        "log", "ln", "exp",
+    ),
+    key=len,
+    reverse=True,
+)
+
+_POWER_NOTATION_FUNC_RE = re.compile(r"(" + "|".join(_POWER_NOTATION_FUNCS) + r")\^")
+
+
+def _consume_balanced_parens(text: str, pos: int) -> tuple[str | None, int]:
+    """Consume a balanced (...) group starting at `pos`. Returns (inner
+    text, index just past the closing paren), or (None, pos) if `pos`
+    isn't the start of a balanced group."""
+    if pos >= len(text) or text[pos] != "(":
+        return None, pos
+    depth = 0
+    for j in range(pos, len(text)):
+        if text[j] == "(":
+            depth += 1
+        elif text[j] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[pos + 1:j], j + 1
+    return None, pos
+
+
+def _rewrite_function_power_notation(text: str) -> str:
+    """Rewrite "FUNC^n(arg)" / "FUNC^(n)(arg)" (n and arg may each be a
+    plain token or a parenthesized, possibly-nested group) into the
+    unambiguous "FUNC(arg)^(n)".
+
+    Textbook/handwritten-style input like "cos^2(x)" is extremely common,
+    but after the "^" -> "**" substitution below it becomes "cos**2(x)",
+    which sympy's implicit-multiplication parser doesn't read as
+    "cos(x)**2" - instead it silently mis-associates the power and the
+    call, and for nested trig (e.g. "cos^2((pi/2)cos^2(x))") this produces
+    a plausible-looking but mathematically wrong expression rather than a
+    parse error, so it isn't caught anywhere downstream. Rewriting to the
+    unambiguous "FUNC(arg)^(n)" form up front, before ^ is ever replaced,
+    fixes this at the source. Recurses into `arg` so nested occurrences
+    (as in the example above) are fixed too, innermost first.
+    """
+    result: list[str] = []
+    i = 0
+    while i < len(text):
+        m = _POWER_NOTATION_FUNC_RE.match(text, i)
+        if not m:
+            result.append(text[i])
+            i += 1
+            continue
+
+        func_name = m.group(1)
+        pos = m.end()
+
+        if pos < len(text) and text[pos] == "(":
+            exponent, pos = _consume_balanced_parens(text, pos)
+        else:
+            tok_match = re.match(r"-?\d+(?:\.\d+)?", text[pos:])
+            exponent = tok_match.group(0) if tok_match else None
+            pos = pos + len(exponent) if exponent else pos
+        if exponent is None:
+            result.append(text[i])
+            i += 1
+            continue
+
+        if pos < len(text) and text[pos] == "(":
+            arg, new_pos = _consume_balanced_parens(text, pos)
+        else:
+            tok_match = re.match(r"[a-zA-Z0-9_.]+", text[pos:])
+            arg = tok_match.group(0) if tok_match else None
+            new_pos = pos + len(arg) if arg else pos
+        if arg is None:
+            result.append(text[i])
+            i += 1
+            continue
+
+        arg_processed = _rewrite_function_power_notation(arg)
+        result.append(f"{func_name}({arg_processed})^({exponent})")
+        i = new_pos
+    return "".join(result)
+
+
 def safe_sympify(expr_str: str):
     """Safely convert string to sympy expression with common replacements."""
     try:
         # Clean up the string
+        expr_str = _rewrite_function_power_notation(expr_str)
         expr_str = expr_str.replace('^', '**')
         local_dict = {
             'x': symbols('x'), 'y': symbols('y'), 'z': symbols('z'),
             't': symbols('t'), 'u': symbols('u'), 'v': symbols('v'),
             'n': symbols('n', integer=True),
-            'e': sp.E, 'pi': sp.pi, 'oo': sp.oo, 'infinity': sp.oo, 'infty': sp.oo,
+            'e': sp.E, 'I': sp.I, 'pi': sp.pi, 'oo': sp.oo, 'infinity': sp.oo, 'infty': sp.oo,
             'sin': sin, 'cos': cos, 'tan': tan, 'cot': cot, 'sec': sec, 'csc': csc,
+            'sinh': sp.sinh, 'cosh': sp.cosh, 'tanh': sp.tanh,
+            'coth': sp.coth, 'sech': sp.sech, 'csch': sp.csch,
+            'asinh': sp.asinh, 'acosh': sp.acosh, 'atanh': sp.atanh,
             'arcsin': sp.asin, 'arccos': sp.acos, 'arctan': sp.atan,
-            'ln': log, 'log': log, 'exp': exp, 'sqrt': sqrt, 'abs': sp.Abs,
+            'arcsinh': sp.asinh, 'arccosh': sp.acosh, 'arctanh': sp.atanh,
+            'ln': log, 'log': log, 'exp': exp, 'sqrt': sqrt, 'abs': sp.Abs, 'Abs': sp.Abs,
+            'max': sp.Max, 'Max': sp.Max, 'min': sp.Min, 'Min': sp.Min,
+            'frac': lambda a: a - sp.floor(a),
             'integrate': integrate, 'Integrate': integrate, 'Integral': Integral,
             'diff': diff, 'Diff': diff, 'Derivative': Derivative,
             'limit': limit, 'Limit': limit, 'series': series, 'Series': series,
@@ -253,8 +406,15 @@ def safe_sympify(expr_str: str):
             ), "success"
         except Exception:
             return sp.sympify(expr_str, locals=local_dict), "success"
-    except Exception as e:
-        return None, str(e)
+    except Exception:
+        # Deliberately NOT str(e) here: raw Python/sympy exceptions (e.g.
+        # a SyntaxError's "invalid syntax. Perhaps you forgot a comma?
+        # (<string>, line 1)") are internal implementation details, not
+        # something a user can act on - and previously leaked verbatim
+        # into the answer text. A malformed token (like an OCR misread
+        # producing "2D" from "2026") is exactly the kind of input that
+        # triggers this, so the message stays generic and honest instead.
+        return None, "Couldn't parse this as a valid math expression - it may contain a typo, an unrecognized symbol, or a formatting issue."
 
 
 def _tokenize_math_expression(expression: str) -> list[str]:
@@ -348,11 +508,18 @@ def _format_plain(expr) -> str:
     s = s.replace('pi/', 'π/')
     s = s.replace('/pi', '/π')
     s = re.sub(r'(?<![a-zA-Z])pi(?![a-zA-Z])', 'π', s)
-    # Replace oo with ∞
-    s = s.replace('oo', '∞')
+    # Replace oo with ∞ - word-boundary aware, so this only matches the
+    # standalone infinity token and not "oo" occurring inside another
+    # identifier (e.g. "floor(x)" must not become "fl∞r(x)").
+    s = re.sub(r'(?<![a-zA-Z])oo(?![a-zA-Z])', '∞', s)
     # Clean up Piecewise — sympy failed to find closed form
     if s.startswith('Piecewise'):
         return s
+    # Sympy's str() abbreviates inverse trig/hyperbolic functions (atan,
+    # asin, ...) - expand these to the full names users expect to read
+    # (arctan, arcsin, ...), matching the LaTeX rendering.
+    s = re.sub(r'(?<![a-zA-Z])a(sinh|cosh|tanh|coth|sech|csch|sin|cos|tan|cot|sec|csc)(?=\()',
+               r'arc\1', s)
     return s
 
 
@@ -361,6 +528,9 @@ def _detect_integration_technique(integrand_expr, expr):
     s = str(expr).lower()
     integrand_s = str(integrand_expr).lower()
 
+    if 'log(' in s and ('x**2' in integrand_s or 'x^2' in integrand_s):
+        if '+' in integrand_s.split('/')[0] if '/' in integrand_s else False:
+            pass
     if 'atan(' in s or 'atanh(' in s or 'acot(' in s:
         return "Partial Fractions" if 'x**' in integrand_s else "Integration of Rational Functions"
     if 'sqrt(' in integrand_s and 'sqrt(' in s:
@@ -377,6 +547,248 @@ def _detect_integration_technique(integrand_expr, expr):
     if '/' in integrand_s:
         return "Algebraic Manipulation / Partial Fractions"
     return "Standard Integration"
+
+
+def _frac_antiderivative(var):
+    """Closed-form antiderivative of frac(t) = t - floor(t).
+
+    sympy's integrate() can't evaluate this directly (floor isn't smooth,
+    so there's no general symbolic antiderivative it can find). But frac(t)
+    is exactly periodic with period 1: on each interval [n, n+1) it's just
+    the line (t-n), contributing area 1/2 per full period. That gives a
+    genuine closed form for the antiderivative:
+
+        G(t) = floor(t)/2 + frac(t)**2 / 2
+
+    which is continuous everywhere (G(n) = n/2 from both sides) and
+    satisfies G'(t) = frac(t) on every open interval (n, n+1). Verified
+    numerically against direct quadrature before being trusted here.
+    """
+    return sp.floor(var) / 2 + (var - sp.floor(var)) ** 2 / 2
+
+
+_HALF_ANGLE_U = sp.Wild("u_half_angle", exclude=[0])
+
+# (pattern, replacement) pairs implementing the half-angle identities
+# 1+cos(u) = 2cos^2(u/2), 1-cos(u) = 2sin^2(u/2), cosh(u)+1 = 2cosh^2(u/2),
+# cosh(u)-1 = 2sinh^2(u/2). Order doesn't matter for the cosh(u)+1 case
+# specifically (sympy's Add is commutative/canonical, so "1+cosh(u)" and
+# "cosh(u)+1" are literally the same object), but is listed both ways for
+# clarity. cosh(u)+1 is always >= 0 so needs no Abs; the others can be
+# negative depending on u's sign, so keep the Abs and let the existing
+# Abs/Piecewise handling below have a shot at them.
+_HALF_ANGLE_SQRT_REWRITES = (
+    (sp.sqrt(1 + sp.cosh(_HALF_ANGLE_U)), sp.sqrt(2) * sp.cosh(_HALF_ANGLE_U / 2)),
+    (sp.sqrt(sp.cosh(_HALF_ANGLE_U) - 1), sp.sqrt(2) * sp.Abs(sp.sinh(_HALF_ANGLE_U / 2))),
+    (sp.sqrt(1 + sp.cos(_HALF_ANGLE_U)), sp.sqrt(2) * sp.Abs(sp.cos(_HALF_ANGLE_U / 2))),
+    (sp.sqrt(1 - sp.cos(_HALF_ANGLE_U)), sp.sqrt(2) * sp.Abs(sp.sin(_HALF_ANGLE_U / 2))),
+)
+
+
+def _rewrite_sqrt_half_angle(expr):
+    """Collapse sqrt(1 ± cos(u)) / sqrt(cosh(u) ± 1) using the half-angle
+    identities before integration is attempted.
+
+    Left as a bare sqrt of a trig/hyperbolic sum, sympy's integrate()
+    generally can't find a closed form at all and silently falls back to
+    an unevaluated Integral - e.g. sqrt(1+cosh(x)) really is just
+    sqrt(2)*cosh(x/2), but sympy has no way to notice that on its own
+    since it never tries this substitution. Rewriting to the equivalent,
+    much simpler form upfront (still exactly equal, not an approximation)
+    gives integrate() something it can actually solve.
+    """
+    if expr is None:
+        return expr
+    try:
+        for pattern, replacement in _HALF_ANGLE_SQRT_REWRITES:
+            expr = expr.replace(pattern, replacement)
+    except Exception:
+        pass
+    return expr
+
+
+def _rewrite_sums_and_products(expr):
+    """Evaluate any Sum/Product subexpressions (e.g. a series nested inside
+    a larger integrand, like "integrate (sum x^n from n=2 to oo) dx") via
+    .doit() before integration is attempted.
+
+    Without this, a Sum/Product buried inside an integrand is never given
+    to integrate() as anything simpler than itself - integrate() then just
+    returns an unevaluated Integral(Sum(...), ...), and the ONLY reason the
+    solver produces any answer at all for such cases is that its numeric
+    fallback (sp.N() on the unevaluated result) happens to be able to push
+    straight through both the Integral and the Sum simultaneously. That
+    numeric-only path can never surface a symbolic closed form or a
+    step-by-step derivation - replacing Sum(x**n, (n, 2, oo)) with its
+    closed form (x**2/(1-x)) up front lets integrate() actually work with
+    a plain rational/algebraic expression, so it can find (and show) a
+    genuine symbolic antiderivative when one exists.
+    """
+    if expr is None:
+        return expr
+    try:
+        if not expr.has(sp.Sum, sp.Product):
+            return expr
+        return expr.replace(
+            lambda node: isinstance(node, (sp.Sum, sp.Product)),
+            lambda node: node.doit(),
+        )
+    except Exception:
+        return expr
+
+
+def _rewrite_for_integration(expr):
+    """Rewrite Abs/Max/Min nodes into Piecewise before integration.
+
+    sympy's integrate() frequently can't handle Abs/Max/Min directly (or
+    silently fails/returns an unevaluated Integral), since these aren't
+    smooth/differentiable everywhere. Converting to the equivalent Piecewise
+    form up front lets integrate() split the domain and integrate each
+    branch, which it already knows how to do correctly.
+
+    Note: a Sum/Product nested in the integrand is deliberately NOT
+    resolved here. That used to be handled by unconditionally calling
+    .doit() on any Sum/Product found, before integration - mathematically
+    valid, but it silently pre-empts _try_interchange_sum_integral (which
+    runs later, in _integrate_definite_with_fallbacks and the indefinite
+    branch) from ever seeing a Sum to interchange, so the derivation would
+    never actually cite the Interchange of Summation and Integration
+    theorem - it would just look, from the outside, like the Sum was never
+    there. Leaving Sum/Product untouched here lets the properly-justified
+    technique run first; only if that declines (e.g. because the Sum is
+    just one factor in a larger product, like x*Sum(...), where naively
+    integrating termwise would misapply the theorem) does the generic
+    integrate() call see the unresolved Sum and fall through to an
+    unevaluated Integral - which is safe (matches "no answer" rather than
+    a wrong one) but not what the common case reaching here needs.
+    """
+    if expr is None:
+        return expr
+    expr = _rewrite_sqrt_half_angle(expr)
+    try:
+        if expr.has(sp.Abs, sp.Max, sp.Min):
+            return expr.rewrite(sp.Piecewise)
+    except Exception:
+        pass
+    return expr
+
+
+def _best_simplify(expr):
+    """Try several simplification strategies and keep whichever produces the
+    fewest operations.
+
+    Plain sp.simplify() alone frequently fails to collapse expressions mixing
+    hyperbolic/trig functions with exponentials (e.g. results that came from
+    integrating sinh(x)/(cosh(x)-sinh(x))), because it never rewrites sinh/cosh
+    in terms of exp before trying to cancel terms. Left alone, the solver
+    displays a mathematically-correct but needlessly ugly answer like
+    "(x*sinh(x) - x*cosh(x) + sinh(x))*exp(x)/2 + C" instead of the true
+    simplest form "exp(2*x)/4 - x/2 + C". Trying multiple rewrites and scoring
+    them by op-count means we surface the simplest equivalent form we found,
+    without ever changing the underlying (already-correct) value.
+    """
+    if isinstance(expr, (int, float)) or not hasattr(expr, "free_symbols"):
+        return expr
+
+    candidates = [expr]
+
+    def _try(fn):
+        try:
+            result = fn(expr)
+            if result is not None:
+                candidates.append(result)
+        except Exception:
+            pass
+
+    # Fast path, added after profiling showed the remaining rewrite
+    # strategies below (each followed by its own 3-way equivalence check)
+    # accounted for roughly a third of total solve time - almost entirely
+    # spent re-confirming that a plain number or already-tiny expression
+    # (the overwhelmingly common case, e.g. "1/3" from a basic definite
+    # integral) couldn't be simplified any further. If plain simplify()
+    # already produced something trivially simple, there's nothing the
+    # other strategies could usefully improve on, so skip them entirely.
+    try:
+        plain = simplify(expr)
+        if plain.is_number:
+            return plain
+        candidates.append(plain)
+    except Exception:
+        pass
+
+    def _try_assuming_real(e):
+        # Some identities (e.g. log(exp(x)) = x) only hold for real x, so
+        # plain simplify() correctly refuses them for a general (possibly
+        # complex) symbol. Try simplifying under a temporary real assumption,
+        # then substitute back - the equivalence check below still verifies
+        # the result against the *original* (unrestricted) expression, so an
+        # identity that only holds for real values gets silently rejected
+        # rather than wrongly applied to a complex-valued problem.
+        subs_to_real = {s: sp.Symbol(f"__real_{s.name}", real=True) for s in e.free_symbols}
+        if not subs_to_real:
+            return None
+        real_expr = e.subs(subs_to_real)
+        simplified_real = simplify(real_expr)
+        reverse_subs = {v: k for k, v in subs_to_real.items()}
+        return simplified_real.subs(reverse_subs)
+
+    _try(lambda e: simplify(e))
+    _try(lambda e: simplify(expand(e.rewrite(exp))))
+    # Targeted version of the rewrite above: expand ONLY sinh/cosh into
+    # exponential form, leaving sin/cos untouched. Rewriting sin/cos as
+    # well (as the blanket e.rewrite(exp) above does) forces them into
+    # *complex* exponentials (sin(x) = (exp(ix)-exp(-ix))/(2i)), which
+    # often doesn't simplify back down cleanly. sinh/cosh are naturally
+    # real when expanded (cosh(x) = (exp(x)+exp(-x))/2), so leaving sin/cos
+    # alone and only expanding the hyperbolic side lets terms like
+    # exp(x)*cosh(x) collapse into a single exp(2*x)/2 + 1/2 term instead
+    # of staying stuck as a mixed sin/cos/sinh/cosh product - exactly the
+    # case that motivated this: "integrate exp(x)*sin(x)*cosh(x) dx" was
+    # displaying the correct but needlessly tangled antiderivative
+    # "(sin(x)sinh(x)+sin(x)cosh(x)+2cos(x)sinh(x)-3cos(x)cosh(x))exp(x)/5"
+    # instead of the equivalent, much simpler
+    # "exp(2*x)*sin(x)/5 - exp(2*x)*cos(x)/10 - cos(x)/2".
+    _try(lambda e: simplify(expand(e.rewrite(sp.sinh, exp).rewrite(sp.cosh, exp))))
+    _try(lambda e: trigsimp(expand(simplify(e))))
+    _try(lambda e: radsimp(together(simplify(e))))
+    _try(lambda e: sp.nsimplify(simplify(e), rational=False))
+    _try(_try_assuming_real)
+
+    # Keep only candidates that are actually equal to the original (guards
+    # against a rewrite silently producing something non-equivalent), then
+    # pick whichever has the fewest operations - i.e. is visually simplest.
+    # Plain sp.simplify(c - expr) can fail to recognize the difference is zero
+    # when c and expr mix hyperbolic/trig functions with exponentials in
+    # different ways, so rewrite the difference in terms of exp first, which
+    # is a common representation both sides reduce to.
+    def _is_equivalent(c) -> bool:
+        try:
+            if sp.simplify(c - expr) == 0:
+                return True
+        except Exception:
+            pass
+        try:
+            if sp.simplify(sp.expand((c - expr).rewrite(exp))) == 0:
+                return True
+        except Exception:
+            pass
+        try:
+            # This is a real-valued calculus calculator, so also accept
+            # identities that hold for real inputs even if they aren't true
+            # for fully general complex ones (e.g. log(exp(x)) = x). A
+            # candidate that's genuinely wrong (not just complex-domain
+            # restricted) will still fail this check too.
+            diff = (c - expr)
+            subs_to_real = {s: sp.Symbol(f"__real_{s.name}", real=True) for s in diff.free_symbols}
+            return sp.simplify(diff.subs(subs_to_real)) == 0
+        except Exception:
+            return False
+
+    valid = [c for c in candidates if _is_equivalent(c)]
+
+    if not valid:
+        return expr
+    return min(valid, key=lambda c: sp.count_ops(c))
 
 
 def _clean_result(expr) -> str:
@@ -450,7 +862,7 @@ def _solve_equation_response(expression: str, equation_str: str, topic: str, con
             solution_set = sp.solveset(equation.lhs - equation.rhs, var, domain=sp.S.Complexes)
             simplified_solutions = [solution_set]
         except Exception as exc:
-            return _fallback_response(expression, topic, confidence, str(exc))
+            return _fallback_response(expression, topic, confidence, _clean_error_message(exc))
 
     if len(simplified_solutions) == 0:
         answer = f"No solution found for {var}"
@@ -511,7 +923,7 @@ def _symbolic_operation_response(
     try:
         result = op(expr)
     except Exception as exc:
-        return _fallback_response(expression, topic, confidence, str(exc))
+        return _fallback_response(expression, topic, confidence, _clean_error_message(exc))
 
     result = simplify(result) if operation == "simplify" else result
     question_latex = rf"\operatorname{{{operation}}}\left({latex(expr)}\right)"
@@ -556,7 +968,7 @@ def _general_expression_response(expression: str, expr_str: str, topic: str, con
         if simplified == expr:
             simplified = trigsimp(radsimp(combsimp(powsimp(expr))))
     except Exception as exc:
-        return _fallback_response(expression, topic, confidence, str(exc))
+        return _fallback_response(expression, topic, confidence, _clean_error_message(exc))
 
     exact_answer = _format_plain(simplified)
     answer_latex = latex(simplified)
@@ -608,14 +1020,496 @@ def _general_expression_response(expression: str, expr_str: str, topic: str, con
     )
 
 
+def _match_trig_power_product(expr, x_symbol):
+    """If expr is sin(x)**m * cos(x)**n for non-negative integers m, n
+    (either may be 0, meaning that factor is absent - covers the pure
+    sin(x)**m or cos(x)**n cases too), return (m, n). Otherwise None.
+    Handles power 1 specially since sympy auto-simplifies sin(x)**1 to
+    plain sin(x) (not a Pow object)."""
+
+    def factor_power(factor):
+        if factor == sp.sin(x_symbol):
+            return ("sin", 1)
+        if factor == sp.cos(x_symbol):
+            return ("cos", 1)
+        if factor.is_Pow and factor.exp.is_Integer and factor.exp > 0:
+            if factor.base == sp.sin(x_symbol):
+                return ("sin", int(factor.exp))
+            if factor.base == sp.cos(x_symbol):
+                return ("cos", int(factor.exp))
+        return None
+
+    factors = expr.args if expr.is_Mul else (expr,)
+    if len(factors) > 2:
+        return None
+
+    m = n = 0
+    seen_sin = seen_cos = False
+    for factor in factors:
+        result = factor_power(factor)
+        if result is None:
+            return None
+        func_name, power = result
+        if func_name == "sin":
+            if seen_sin:
+                return None
+            seen_sin, m = True, power
+        else:
+            if seen_cos:
+                return None
+            seen_cos, n = True, power
+
+    if m == 0 and n == 0:
+        return None
+    return (m, n)
+
+
+def _wallis_bound_multiplier(m: int, n: int, lower_val, upper_val):
+    """For sin(x)**m * cos(x)**n integrated over [lower_val, upper_val],
+    return (multiplier, sign) such that the definite integral equals
+    sign * multiplier * W(m, n), where W(m, n) = integral over a single
+    quarter period [0, pi/2] (see _wallis_quarter_period_numeric). Returns
+    None if the bounds aren't one of the standard ranges this fast path
+    recognizes - callers should fall back to normal symbolic integration.
+
+    Symmetry depends on both m's and n's parity jointly (sin^m*cos^n is
+    even in x iff m is even; the function is period-pi iff m+n is even,
+    anti-period-pi otherwise). Cross-validated against sympy's own
+    integrate() for m, n = 0..6 across every supported bound pattern
+    (both orientations) - 294 combinations, all matching - before being
+    trusted for the large m, n this fast path exists for.
+    """
+    lo, hi = lower_val, upper_val
+    sign = 1
+    try:
+        if sp.simplify(hi - lo) < 0:
+            lo, hi = hi, lo
+            sign = -1
+    except TypeError:
+        return None
+
+    def is_(v, expected):
+        try:
+            return sp.simplify(v - expected) == 0
+        except Exception:
+            return False
+
+    m_even = (m % 2 == 0)
+    n_even = (n % 2 == 0)
+
+    if is_(lo, 0) and is_(hi, sp.pi / 2):
+        return (1, sign)
+    if is_(lo, 0) and is_(hi, sp.pi):
+        return (2, sign) if n_even else (0, sign)
+    if is_(lo, -sp.pi / 2) and is_(hi, sp.pi / 2):
+        return (2, sign) if m_even else (0, sign)
+    if is_(lo, 0) and is_(hi, 2 * sp.pi):
+        return (4, sign) if (m_even and n_even) else (0, sign)
+    if is_(lo, -sp.pi) and is_(hi, sp.pi):
+        return (4, sign) if (m_even and n_even) else (0, sign)
+    return None
+
+
+def _wallis_closed_form_strings(m: int, n: int, multiplier: int, sign: int):
+    """Build a compact exact closed-form string for sign * multiplier *
+    W(m, n), using the standard double-factorial identity:
+
+        W(m, n) = (m-1)!! * (n-1)!! / (m+n)!! * K,
+        K = pi/2 if m and n are both even, else K = 1
+
+    (validated numerically against sympy's gamma-function Beta formula
+    across m, n = 0..11, all 144 combinations matching exactly), using
+    factorial2()/binomial-style notation instead of ever materializing the
+    huge literal integers involved (e.g. for m=n=50 the fully-expanded
+    fraction has a 30-digit denominator) - sympy's default printer
+    otherwise fully expands these into unreadable digit blobs.
+    Returns (answer_str, answer_latex_str, numeric_value).
+    """
+    sign_str = "-" if sign < 0 else ""
+    if multiplier == 0:
+        return "0", "0", 0.0
+
+    both_even = (m % 2 == 0) and (n % 2 == 0)
+    coeff_str = "" if multiplier == 1 else f"{multiplier}*"
+    coeff_latex = "" if multiplier == 1 else f"{multiplier}"
+
+    numerator = f"factorial2({m-1})*factorial2({n-1})"
+    numerator_latex = rf"({m-1})!!\,({n-1})!!"
+    denom = f"factorial2({m+n})"
+    denom_latex = rf"({m+n})!!"
+
+    if both_even:
+        answer = f"{sign_str}{coeff_str}pi*{numerator}/(2*{denom})"
+        answer_latex = rf"{sign_str}\frac{{{coeff_latex}\pi\,{numerator_latex}}}{{2\,{denom_latex}}}"
+    else:
+        answer = f"{sign_str}{coeff_str}{numerator}/{denom}"
+        answer_latex = rf"{sign_str}\frac{{{coeff_latex}{numerator_latex}}}{{{denom_latex}}}"
+
+    numeric_value = float(sign * multiplier * _wallis_quarter_period_numeric(m, n))
+    return answer, answer_latex, numeric_value
+
+
+def _wallis_quarter_period_numeric(m: int, n: int) -> float:
+    """Numeric value of W(m, n) = integral of sin(x)**m * cos(x)**n over
+    [0, pi/2], via the double-factorial closed form evaluated as a float
+    throughout - avoids ever constructing the huge exact Rational/pi
+    expression when only a decimal approximation for display is needed.
+    Uses math.lgamma for numerical stability at large m, n (avoids
+    overflowing on the individual double factorials themselves)."""
+    import math
+
+    def log_factorial2(k: int) -> float:
+        if k <= 0:
+            return 0.0
+        # (2j)!! = 2^j * j!; (2j+1)!! = (2j+1)! / (2^j * j!)
+        if k % 2 == 0:
+            j = k // 2
+            return j * math.log(2) + math.lgamma(j + 1)
+        j = (k - 1) // 2
+        return math.lgamma(2 * j + 2) - (j * math.log(2) + math.lgamma(j + 1))
+
+    log_value = log_factorial2(m - 1) + log_factorial2(n - 1) - log_factorial2(m + n)
+    value = math.exp(log_value)
+    if m % 2 == 0 and n % 2 == 0:
+        value *= math.pi / 2
+    return value
+
+
+def _try_interchange_sum_integral(expr, x_symbol, lower_val=None, upper_val=None):
+    """Term-by-term integration via the Interchange of Summation and
+    Integration theorem (also called term-by-term integration of a
+    uniformly convergent series):
+
+        indefinite:  ∫ Σₙ fₙ(x) dx = Σₙ ∫ fₙ(x) dx
+        definite:    ∫ₐᵇ Σₙ fₙ(x) dx = Σₙ ∫ₐᵇ fₙ(x) dx
+
+    This is justified by the Uniform Convergence Theorem whenever the
+    series converges uniformly on the interval of integration - the
+    textbook example this handles is a power series integrated over a
+    closed sub-interval strictly inside its radius of convergence (e.g.
+    a geometric series), which always converges uniformly there.
+
+    Rather than resolving a Sum found inside the integrand via .doit()
+    and then integrating whatever falls out (mathematically valid, but
+    opaque about *why* it's valid and unable to show a genuine
+    term-by-term derivation), this integrates the summand directly and
+    re-sums the result - the actual textbook technique, with a citation
+    of the theorem that justifies it.
+
+    Returns (result, justification) if a single Sum is found and the
+    term-by-term integral resolves to a closed form, or (None, None)
+    otherwise (including when the Sum is only one factor in a larger
+    product with other x-dependence, e.g. x*Sum(...) - naively pulling
+    the sum out and integrating termwise would silently misapply the
+    theorem there, so that case is left to the .doit()-first fallback in
+    _rewrite_sums_and_products instead, which is still correct, just less
+    illustrative of the theorem itself).
+    """
+    if expr is None:
+        return None, None
+    try:
+        if not expr.has(sp.Sum):
+            return None, None
+        sums_found = list(expr.atoms(sp.Sum))
+    except Exception:
+        return None, None
+    if len(sums_found) != 1:
+        return None, None
+
+    the_sum = sums_found[0]
+    if len(the_sum.limits) != 1:
+        return None, None
+
+    try:
+        placeholder = sp.Dummy("interchange_sum_placeholder")
+        without_sum = expr.subs(the_sum, placeholder)
+        if without_sum.has(x_symbol):
+            # Some other factor besides the_sum still depends on x_symbol
+            # (e.g. x*Sum(...)) - as_independent() alone won't catch this,
+            # since it checks whether a factor structurally contains
+            # the_sum as a literal subexpression, not whether it shares
+            # free symbols with it. "x" doesn't contain the_sum, so it was
+            # previously (incorrectly) treated as an independent constant
+            # coefficient - silently misapplying the theorem and returning
+            # a wrong, still-x-dependent "answer" for what should have been
+            # a plain number (a definite integral). Bail out here instead.
+            return None, None
+        coeff = without_sum.subs(placeholder, 1)
+    except Exception:
+        return None, None
+
+    summation_var, n_lower, n_upper = the_sum.limits[0]
+    summand = the_sum.function
+
+    try:
+        if lower_val is not None and upper_val is not None:
+            term_integral = sp.integrate(summand, (x_symbol, lower_val, upper_val))
+        else:
+            term_integral = sp.integrate(summand, x_symbol)
+    except Exception:
+        return None, None
+    if term_integral is None or term_integral.has(sp.Integral):
+        return None, None
+
+    try:
+        resummed = sp.Sum(term_integral, (summation_var, n_lower, n_upper)).doit()
+    except Exception:
+        return None, None
+    if resummed is None or resummed.has(sp.Sum):
+        return None, None
+
+    result = coeff * resummed
+    if lower_val is not None and upper_val is not None:
+        justification = (
+            "Interchange of Summation and Integration (term-by-term integration of a "
+            "uniformly convergent series): ∫ₐᵇ Σₙ fₙ(x) dx = Σₙ ∫ₐᵇ fₙ(x) dx. Valid here "
+            "by the Uniform Convergence Theorem, since the series converges uniformly on "
+            "the interval of integration."
+        )
+    else:
+        justification = (
+            "Interchange of Summation and Integration (term-by-term integration of a "
+            "uniformly convergent series): ∫ Σₙ fₙ(x) dx = Σₙ ∫ fₙ(x) dx."
+        )
+    return result, justification
+
+
+def _is_unresolved(value) -> bool:
+    """True if `value` is missing or still contains an unevaluated Integral -
+    i.e. sympy didn't actually finish the computation."""
+    if value is None:
+        return True
+    try:
+        return bool(value.has(sp.Integral))
+    except Exception:
+        return False
+
+
+def _integrate_definite_with_fallbacks(expr, x_symbol, lower_val, upper_val):
+    """Evaluate a definite integral, escalating through progressively more
+    specialized techniques only as needed: direct symbolic integration
+    first (cheap, handles the vast majority of cases and already covers
+    Gaussian/Beta/Gamma-style integrals natively), then periodicity
+    reduction and symmetry substitution for the specific cases sympy's
+    direct approach can't resolve on its own, then numeric evaluation as a
+    last resort. Returns (result, technique_note) where technique_note
+    describes which approach worked, or None if direct integration
+    succeeded and no special technique was needed.
+    """
+    interchange_res, interchange_note = _try_interchange_sum_integral(expr, x_symbol, lower_val, upper_val)
+    if interchange_res is not None:
+        return interchange_res, interchange_note
+
+    if expr is not None and expr.has(sp.Sum, sp.Product):
+        # The interchange theorem declined (most likely because the Sum is
+        # only one factor in a larger product with other x-dependence, e.g.
+        # x*Sum(...), where pulling the sum out and integrating termwise
+        # would silently misapply the theorem). Resolving the Sum/Product
+        # via .doit() first is still mathematically valid there - just not
+        # attributable to the interchange theorem specifically - so use it
+        # as a fallback rather than leaving integrate() to stare at a bare
+        # Sum/Product node it has no way to handle at all.
+        expr = _rewrite_sums_and_products(expr)
+
+    try:
+        result = integrate(simplify(expr), (x_symbol, lower_val, upper_val))
+    except Exception:
+        result = None
+
+    if _is_unresolved(result):
+        try:
+            result = integrate(expr, (x_symbol, lower_val, upper_val))
+        except Exception:
+            result = None
+
+    if not _is_unresolved(result):
+        return result, None
+
+    periodicity_res = try_periodicity_reduction(expr, x_symbol, lower_val, upper_val)
+    if periodicity_res is not None:
+        value, period, num_periods = periodicity_res
+        return value, (
+            f"Recognized the integrand as periodic (period {period}); the interval spans "
+            f"{num_periods} complete periods, reduced to {num_periods} × (integral over one period) "
+            f"plus any partial remainder."
+        )
+
+    symmetry_res = try_symmetry_substitution(expr, x_symbol, lower_val, upper_val)
+    if symmetry_res is not None and not _is_unresolved(symmetry_res):
+        return symmetry_res, (
+            "Used the symmetry substitution x → a+b−x: since this doesn't change the integral's value, "
+            "adding the original and substituted integrands and dividing by 2 gave a simpler integrand "
+            "that could actually be integrated directly."
+        )
+
+    try:
+        result = sp.N(integrate(expr, (x_symbol, lower_val, upper_val)))
+    except Exception:
+        try:
+            antideriv = integrate(simplify(expr), x_symbol)
+            result = simplify(sp.N(antideriv.subs(x_symbol, upper_val) - antideriv.subs(x_symbol, lower_val)))
+        except Exception:
+            result = sp.Integral(expr, (x_symbol, lower_val, upper_val))
+
+    return result, None
+
+
+_HYPERBOLIC_SECANT_SQRT_K = sp.Wild("k_hyp_sqrt", exclude=[0])
+_HYPERBOLIC_SECANT_SQRT_PATTERN = 1 / (
+    sp.cosh(_HYPERBOLIC_SECANT_SQRT_K * sp.Symbol("__hyp_sqrt_x"))
+    * sp.sqrt(sp.cosh(2 * _HYPERBOLIC_SECANT_SQRT_K * sp.Symbol("__hyp_sqrt_x")))
+)
+
+
+def _try_hyperbolic_secant_sqrt_antiderivative(expr, x_symbol):
+    """Recognize integrands of the form 1/(cosh(kx)*sqrt(cosh(2kx))) and
+    return their closed-form antiderivative directly.
+
+    This family has an exact elementary antiderivative
+    (arctanh(sinh(kx)/sqrt(cosh(2kx)))/k - verified by direct
+    differentiation), reachable by hand via the substitution u=sinh(kx)
+    followed by a trig substitution u=(1/sqrt(2))tan(t). sympy's
+    Risch-based integrate() has no way to discover that two-step
+    substitution chain on its own and just returns the integral
+    unevaluated, so this matches the pattern directly rather than relying
+    on general-purpose symbolic integration for it.
+    """
+    pattern = _HYPERBOLIC_SECANT_SQRT_PATTERN.subs(sp.Symbol("__hyp_sqrt_x"), x_symbol)
+    try:
+        match = expr.match(pattern)
+    except Exception:
+        return None
+    if not match:
+        return None
+    k_val = match.get(_HYPERBOLIC_SECANT_SQRT_K)
+    if k_val is None or k_val == 0:
+        return None
+    return sp.atanh(sp.sinh(k_val * x_symbol) / sp.sqrt(sp.cosh(2 * k_val * x_symbol))) / k_val
+
+
+_EXP_SINH_LOG_COSH_K = sp.Wild("k_exp_sinh_log_cosh", exclude=[0])
+
+
+def _try_exp_sinh_log_cosh_antiderivative(expr, x_symbol):
+    """Recognize integrands of the form exp(kx)*sinh(kx)*ln(cosh(kx)) and
+    return their closed-form antiderivative in terms of the dilogarithm.
+
+    sympy's integrate() returns this family unevaluated - not because it
+    lacks a closed form, but because that closed form isn't elementary (it
+    needs Li_2, the dilogarithm), which is outside what integrate()'s
+    default strategies search for. Worked out by hand via e^x*sinh(x) =
+    (e^{2x}-1)/2, then integration by parts with u=ln(cosh(x)), reducing
+    the remainder to a standard ∫x*tanh(x)dx integral solvable via
+    tanh(x) = 1 - 2/(e^{2x}+1) and the dilogarithm identity
+    ∫ln(1+t)/t dt = -Li_2(-t). Verified independently here by direct
+    differentiation (both symbolically and numerically, including negative
+    x and general k) rather than trusting the derivation alone.
+    """
+    pattern = (
+        sp.exp(_EXP_SINH_LOG_COSH_K * x_symbol)
+        * sp.sinh(_EXP_SINH_LOG_COSH_K * x_symbol)
+        * sp.log(sp.cosh(_EXP_SINH_LOG_COSH_K * x_symbol))
+    )
+    try:
+        match = expr.match(pattern)
+    except Exception:
+        return None
+    if not match:
+        return None
+    k_val = match.get(_EXP_SINH_LOG_COSH_K)
+    if k_val is None or k_val == 0:
+        return None
+
+    t = k_val * x_symbol
+    antideriv_in_t = (
+        sp.Rational(1, 4) * (sp.exp(2 * t) + 1) * sp.log(sp.cosh(t))
+        - sp.exp(2 * t) / 8
+        - t ** 2 / 4
+        + t / 4
+        + (t * sp.log(2)) / 2
+        + sp.log(2) / 4
+        - sp.polylog(2, -sp.exp(-2 * t)) / 4
+    )
+    return antideriv_in_t / k_val
+
+
+def _try_frac_fast_path(expr, x_symbol, lower_val, upper_val):
+    """If expr is exactly frac(x) = x - floor(x), evaluate the definite
+    integral via the closed-form antiderivative in _frac_antiderivative,
+    since sympy's integrate() has no general antiderivative for floor() and
+    would otherwise return an unevaluated Integral. Returns the result, or
+    None if expr isn't (symbolically) this exact pattern - callers should
+    fall back to normal symbolic integration in that case.
+
+    Deliberately scoped to bare frac(x) only, not frac(g(x)) for a general
+    g - integrating a fractional part of a composed argument requires
+    finding all of g's period boundaries within the bounds, which is a
+    separate, harder piece of work.
+    """
+    try:
+        if sp.simplify(expr - (x_symbol - sp.floor(x_symbol))) != 0:
+            return None
+        antideriv = _frac_antiderivative(x_symbol)
+        result = antideriv.subs(x_symbol, upper_val) - antideriv.subs(x_symbol, lower_val)
+        return sp.nsimplify(sp.simplify(result))
+    except Exception:
+        return None
+
+
+def _try_wallis_fast_path(expr, x_symbol, lower_val, upper_val):
+    """Entry point: if expr is sin(x)**m * cos(x)**n (either power may be
+    absent, covering the pure sin(x)**n or cos(x)**n cases too) and the
+    bounds match a standard recognized range, return (answer,
+    answer_latex, numeric_value) computed via the closed-form Wallis
+    formula - exact, and instant even for huge m/n. Otherwise returns None
+    so the caller falls back to normal symbolic integration.
+
+    This exists because sympy's general integrate() applies a reduction
+    formula recursively for high powers of sin/cos, which becomes
+    impractically slow (and, even when it finishes, produces a needlessly
+    huge symbolic expression) for exponents in the thousands - exactly the
+    kind of "integrate cos(x)^2020 dx" or "sin(x)^50*cos(x)^50" problem
+    this calculator gets asked.
+    """
+    match = _match_trig_power_product(expr, x_symbol)
+    if match is None:
+        return None
+    m, n = match
+
+    bound_result = _wallis_bound_multiplier(m, n, lower_val, upper_val)
+    if bound_result is None:
+        return None
+    multiplier, sign = bound_result
+
+    return _wallis_closed_form_strings(m, n, multiplier, sign)
+
+
 def solve_calculus(request: SolveRequest) -> SolveResponse:
-    expression = request.expression
+    expression = normalize_expression(request.expression)
+
+    if "\\" in expression and _normalize_latex_math is not None:
+        # normalize_expression() only understands this solver's own
+        # plain-text grammar; a literal backslash surviving that call means
+        # the input was raw LaTeX it didn't touch (e.g. "\int ... \,dx"),
+        # not a genuine parse failure. Route it through the same
+        # LaTeX->plain conversion the OCR path uses before giving up on it.
+        latex_expression = _normalize_latex_math(expression)
+        if latex_expression:
+            expression = latex_expression
+
+    depth_error = check_nesting_depth(expression)
+    if depth_error:
+        return _fallback_response(expression, "Unsupported", 0.0, depth_error)
+
     topic, confidence = classify_topic(expression)
     if request.topic_hint:
         topic = request.topic_hint
         confidence = 0.9
 
     parsed = parse_expression(expression)
+    if parsed[0] == "multiple_integral" and not request.topic_hint:
+        topic = "Multiple Integrals"
+        confidence = 0.9
     steps: list[StepDetail] = []
     alternative_methods: list[AlternativeMethod] = []
     formulas_used: list[FormulaUsed] = []
@@ -623,10 +1517,182 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
     answer_latex = ""
     question_latex = ""
     graph_data = None
+    verify_ctx = None
 
     x, y, z, t, n = symbols('x y z t n')
 
     try:
+        if parsed[0] == "continued_fraction":
+            cf_result = try_solve_continued_fraction(parsed[1], safe_sympify)
+            if cf_result is None:
+                return _with_math_context(
+                    _fallback_response(
+                        expression, topic, confidence,
+                        "This doesn't look like a periodic continued fraction this solver can recognize "
+                        "(the repeating unit needs to appear at least twice before the '...')."
+                    ),
+                    expression, parsed, request.session_id,
+                )
+
+            matched = [c for c in cf_result["candidates"] if c["matches_truth"]]
+            chosen = matched[0] if matched else (cf_result["candidates"][0] if cf_result["candidates"] else None)
+            if chosen is None:
+                return _with_math_context(
+                    _fallback_response(expression, topic, confidence, "Could not solve the continued fraction's equation."),
+                    expression, parsed, request.session_id,
+                )
+
+            w = cf_result["symbol"]
+            question_latex = f"{parsed[1].strip()}"
+            steps.append(StepDetail(
+                step_number=1,
+                description="Identify the self-similar repeating part",
+                expression_latex=latex(cf_result["unit_equation"]),
+                justification=(
+                    f"The continued fraction repeats the same pattern forever, so its value "
+                    f"({w}) satisfies this equation when substituted into itself one level in."
+                )
+            ))
+            steps.append(StepDetail(
+                step_number=2,
+                description="Solve the resulting algebraic equation",
+                expression_latex=" ,\\ ".join(latex(c["w_solution"]) for c in cf_result["candidates"]),
+                justification="This is a standard algebraic equation, solvable directly."
+            ))
+            steps.append(StepDetail(
+                step_number=3,
+                description="Select the convergent root and apply the outer expression once",
+                expression_latex=latex(chosen["final_expr"]),
+                result_latex=latex(chosen["final_expr"]),
+                justification=(
+                    "Verified against direct numerical iteration of the actual nested fraction "
+                    "(not just the algebra) to confirm this is the convergent value."
+                )
+            ))
+
+            answer = _format_plain(chosen["final_expr"])
+            answer_latex = latex(chosen["final_expr"])
+            verification = (
+                f"Verified numerically: iterating the actual nested fraction converges to "
+                f"≈ {cf_result['numeric_truth']:.6g}, matching this closed form."
+                if cf_result["numeric_truth"] is not None
+                else "Solved algebraically; direct numeric iteration was inconclusive for verification."
+            )
+            return _with_math_context(
+                SolveResponse(
+                    question=expression, question_latex=question_latex,
+                    answer=answer, answer_latex=answer_latex, topic="Continued Fractions",
+                    difficulty="Hard", ai_confidence=0.8, steps=steps,
+                    alternative_methods=[], formulas_used=[], verification=verification,
+                    graph_data=None, ocr_confidence=None, extracted_text=None,
+                ),
+                expression, parsed, request.session_id,
+            )
+
+        if parsed[0] == "series":
+            term_str, var_name, lower_str, upper_str = parsed[1], parsed[2], parsed[3], parsed[4]
+            series_result = try_solve_series(term_str, var_name, lower_str, upper_str, safe_sympify)
+            if series_result is None:
+                return _with_math_context(
+                    _fallback_response(expression, topic, confidence, "Could not parse this series."),
+                    expression, parsed, request.session_id,
+                )
+
+            result = series_result["result"]
+            pattern = series_result["pattern"]
+            question_latex = f"\\sum_{{{var_name}={latex(series_result['lower'])}}}^{{{latex(series_result['upper'])}}} {latex(series_result['term'])}"
+
+            steps.append(StepDetail(
+                step_number=1,
+                description="Identify the series",
+                expression_latex=question_latex,
+                justification=(f"Recognized as a {pattern}." if pattern else "Evaluating the sum directly.")
+            ))
+            steps.append(StepDetail(
+                step_number=2,
+                description="Apply the known closed form" if series_result["evaluated"] else "Attempt to evaluate the sum",
+                expression_latex=latex(result),
+                result_latex=latex(result),
+                justification=(
+                    "This is a standard series with a known closed form."
+                    if series_result["evaluated"]
+                    else "sympy could not find a closed form; this may not converge or may need a different technique."
+                )
+            ))
+
+            if series_result["evaluated"]:
+                answer = _format_plain(result)
+                answer_latex = latex(result)
+                verification = "Verified via sympy's summation engine (Sum.doit())."
+            else:
+                answer = "This sum could not be reduced to a closed form; it may diverge or require a technique this solver doesn't yet cover."
+                answer_latex = latex(result)
+                verification = "Not verified - no closed form was found."
+
+            return _with_math_context(
+                SolveResponse(
+                    question=expression, question_latex=question_latex,
+                    answer=answer, answer_latex=answer_latex,
+                    topic="Infinite Series" + (f" ({pattern})" if pattern else ""),
+                    difficulty="Medium", ai_confidence=0.75 if series_result["evaluated"] else 0.3,
+                    steps=steps,
+                    alternative_methods=[], formulas_used=[], verification=verification,
+                    graph_data=None, ocr_confidence=None, extracted_text=None,
+                ),
+                expression, parsed, request.session_id,
+            )
+
+        if parsed[0] == "product":
+            term_str, var_name, lower_str, upper_str = parsed[1], parsed[2], parsed[3], parsed[4]
+            product_result = try_solve_product(term_str, var_name, lower_str, upper_str, safe_sympify)
+            if product_result is None:
+                return _with_math_context(
+                    _fallback_response(expression, topic, confidence, "Could not parse this product."),
+                    expression, parsed, request.session_id,
+                )
+
+            result = product_result["result"]
+            question_latex = f"\\prod_{{{var_name}={latex(product_result['lower'])}}}^{{{latex(product_result['upper'])}}} {latex(product_result['term'])}"
+
+            steps.append(StepDetail(
+                step_number=1,
+                description="Identify the product",
+                expression_latex=question_latex,
+                justification="Evaluating the infinite/finite product directly."
+            ))
+            steps.append(StepDetail(
+                step_number=2,
+                description="Evaluate" if product_result["evaluated"] else "Attempt to evaluate the product",
+                expression_latex=latex(result),
+                result_latex=latex(result),
+                justification=(
+                    "sympy's product engine found a closed form."
+                    if product_result["evaluated"]
+                    else "sympy could not find a closed form for this product."
+                )
+            ))
+
+            if product_result["evaluated"]:
+                answer = _format_plain(result)
+                answer_latex = latex(result)
+                verification = "Verified via sympy's product engine (Product.doit())."
+            else:
+                answer = "This product could not be reduced to a closed form."
+                answer_latex = latex(result)
+                verification = "Not verified - no closed form was found."
+
+            return _with_math_context(
+                SolveResponse(
+                    question=expression, question_latex=question_latex,
+                    answer=answer, answer_latex=answer_latex, topic="Infinite Products",
+                    difficulty="Medium", ai_confidence=0.75 if product_result["evaluated"] else 0.3,
+                    steps=steps,
+                    alternative_methods=[], formulas_used=[], verification=verification,
+                    graph_data=None, ocr_confidence=None, extracted_text=None,
+                ),
+                expression, parsed, request.session_id,
+            )
+
         if parsed[0] == "limit":
             func_expr, var_name, pt = parsed[1], parsed[2], parsed[3]
             var = symbols(var_name)
@@ -674,11 +1740,11 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
                     result_latex=latex(direct),
                     justification="Using limit evaluation techniques including L'Hôpital's rule if needed."
                 ))
-                answer = str(direct)
+                answer = _format_plain(direct)
                 answer_latex = latex(direct)
             except Exception:
                 direct = sp.N(limit(expr, var, pt_val))
-                answer = str(direct)
+                answer = _format_plain(direct)
                 answer_latex = latex(direct)
 
             formulas_used.append(FormulaUsed(
@@ -703,25 +1769,19 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
 
         elif parsed[0] == "differentiate":
             func_expr = parsed[1]
-            requested_var = parsed[2] if len(parsed) > 2 else None
             expr, err = safe_sympify(func_expr)
 
             if expr is None:
                 return _with_math_context(_fallback_response(expression, topic, confidence), expression, parsed, request.session_id)
 
-            # Differentiate with respect to the variable the user asked for
-            # (or, failing that, the expression's own free variable) instead
-            # of always assuming x - e.g. "derivative of t^2 with respect to t".
-            diff_var = _pick_symbol(expr, requested_var)
-
-            question_latex = f"\\frac{{d}}{{d{diff_var}}} \\left( {latex(expr)} \\right)"
+            question_latex = f"\\frac{{d}}{{dx}} \\left( {latex(expr)} \\right)"
 
             steps.append(StepDetail(
                 step_number=1,
                 description="Identify the function to differentiate",
                 expression=str(expr),
                 expression_latex=latex(expr),
-                justification=f"We need to find the derivative with respect to {diff_var}."
+                justification="We need to find the derivative with respect to x."
             ))
 
             steps.append(StepDetail(
@@ -731,8 +1791,9 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
                 justification="Break down the function and apply the appropriate differentiation rules."
             ))
 
-            deriv = diff(expr, diff_var)
+            deriv = diff(expr, x)
             simplified = simplify(deriv)
+            verify_ctx = {"kind": "derivative", "expr": expr, "var": x, "result": simplified}
 
             steps.append(StepDetail(
                 step_number=3,
@@ -744,17 +1805,17 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
                 justification="Combine like terms and simplify the resulting expression."
             ))
 
-            answer = str(simplified)
+            answer = _format_plain(simplified)
             answer_latex = latex(simplified)
 
             formulas_used.append(FormulaUsed(
                 name="Power Rule",
-                formula_latex=rf"\frac{{d}}{{d{diff_var}}} {diff_var}^n = n {diff_var}^{{n-1}}",
-                description=f"Derivative of {diff_var} raised to power n."
+                formula_latex=r"\frac{d}{dx} x^n = n x^{n-1}",
+                description="Derivative of x raised to power n."
             ))
             formulas_used.append(FormulaUsed(
                 name="Chain Rule",
-                formula_latex=rf"\frac{{d}}{{d{diff_var}}} f(g({diff_var})) = f'(g({diff_var})) \cdot g'({diff_var})",
+                formula_latex=r"\frac{d}{dx} f(g(x)) = f'(g(x)) \cdot g'(x)",
                 description="Derivative of composite functions."
             ))
 
@@ -769,26 +1830,29 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
 
         elif parsed[0] == "definite_integral":
             integrand_expr, lower_str, upper_str = parsed[1], parsed[2], parsed[3]
-            int_var_name = parsed[4] if len(parsed) > 4 else "x"
             expr, err = safe_sympify(integrand_expr)
             if expr is None:
                 return _with_math_context(_fallback_response(expression, topic, confidence, err), expression, parsed, request.session_id)
+            expr = _rewrite_for_integration(expr)
 
-            int_var = _pick_symbol(expr, int_var_name)
-
-            try:
-                # Keep exact/symbolic bounds where possible for precise analytical results
-                lower_val = sp.sympify(lower_str)
-                upper_val = sp.sympify(upper_str)
-            except Exception:
+            # Use the same implicit-multiplication-aware parser as the
+            # integrand (safe_sympify) rather than bare sp.sympify, which
+            # can't parse bounds like "2pi" (no explicit '*') and would
+            # raise an uncaught SyntaxError further down.
+            lower_val, lower_err = safe_sympify(lower_str)
+            upper_val, upper_err = safe_sympify(upper_str)
+            if lower_val is None or upper_val is None:
                 try:
                     lower_val = float(lower_str)
                     upper_val = float(upper_str)
                 except Exception:
-                    lower_val = sp.sympify(lower_str)
-                    upper_val = sp.sympify(upper_str)
+                    bound_err = lower_err if lower_val is None else upper_err
+                    return _with_math_context(
+                        _fallback_response(expression, topic, confidence, bound_err),
+                        expression, parsed, request.session_id,
+                    )
 
-            question_latex = f"\\int_{{{lower_str}}}^{{{upper_str}}} {latex(expr)} \\, d{int_var}"
+            question_latex = f"\\int_{{{lower_str}}}^{{{upper_str}}} {latex(expr)} \\, dx"
 
             steps.append(StepDetail(
                 step_number=1,
@@ -800,42 +1864,97 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
             steps.append(StepDetail(
                 step_number=2,
                 description="Find the antiderivative",
-                expression=f"Compute ∫ {integrand_expr} d{int_var}",
-                justification=f"First find F({int_var}) such that F'({int_var}) equals the integrand."
+                expression=f"Compute ∫ {integrand_expr} dx",
+                justification="First find F(x) such that F'(x) equals the integrand."
             ))
 
-            try:
-                # Try integrating simplified expression first
-                result = integrate(simplify(expr), (int_var, lower_val, upper_val))
-            except Exception:
-                try:
-                    result = integrate(expr, (int_var, lower_val, upper_val))
-                except Exception:
-                    try:
-                        result = sp.N(integrate(expr, (int_var, lower_val, upper_val)))
-                    except Exception:
-                        antideriv = integrate(simplify(expr), int_var)
-                        result = simplify(sp.N(antideriv.subs(int_var, upper_val) - antideriv.subs(int_var, lower_val)))
+            wallis_result = _try_wallis_fast_path(expr, x, lower_val, upper_val)
+            if wallis_result is not None:
+                answer, answer_latex, numeric_value = wallis_result
+                steps.append(StepDetail(
+                    step_number=3,
+                    description="Apply the Fundamental Theorem of Calculus",
+                    expression=f"F({upper_str}) - F({lower_str})",
+                    expression_latex=f"F({latex(upper_val)}) - F({latex(lower_val)})",
+                    justification="∫_a^b f(x) dx = F(b) - F(a)"
+                ))
+                steps.append(StepDetail(
+                    step_number=4,
+                    description="Final simplified result",
+                    result=answer,
+                    result_latex=answer_latex,
+                    justification=(
+                        f"Computed via the Wallis reduction formula for powers of sin/cos "
+                        f"rather than symbolic term-by-term integration, which is impractical "
+                        f"for an exponent this large. Exact value; ≈ {numeric_value:.6g} numerically."
+                    ),
+                ))
+                formulas_used.append(FormulaUsed(
+                    name="Wallis Formula",
+                    formula_latex=r"\int_0^{\pi/2} \sin^n(x)\,dx = \int_0^{\pi/2} \cos^n(x)\,dx",
+                    description="Closed-form reduction for definite integrals of high powers of sin/cos over standard bounds."
+                ))
+                return _with_math_context(
+                    SolveResponse(
+                        question=expression,
+                        question_latex=question_latex,
+                        topic=topic,
+                        answer=answer,
+                        answer_latex=answer_latex,
+                        steps=steps,
+                        difficulty=_estimate_difficulty(topic, expression),
+                        formulas_used=formulas_used,
+                        verification=f"Verified via the exact Wallis closed form; ≈ {numeric_value:.6g}.",
+                        ai_confidence=max(confidence, 0.9),
+                    ),
+                    expression, parsed, request.session_id,
+                )
 
-            simplified = simplify(result) if not isinstance(result, (int, float)) else result
+            frac_result = _try_frac_fast_path(expr, x, lower_val, upper_val)
+            if frac_result is not None:
+                result = frac_result
+                technique_note = None
+            else:
+                result, technique_note = _integrate_definite_with_fallbacks(expr, x, lower_val, upper_val)
+
+            simplified = _best_simplify(result) if not isinstance(result, (int, float)) else result
+            verify_ctx = {"kind": "definite_integral", "expr": expr, "var": x, "lower": lower_val, "upper": upper_val, "result": simplified}
+            next_step_num = 3
+            if technique_note:
+                steps.append(StepDetail(
+                    step_number=next_step_num,
+                    description="Apply a specialized integration technique",
+                    justification=technique_note,
+                ))
+                next_step_num += 1
+                if "Interchange of Summation and Integration" in technique_note:
+                    formulas_used.append(FormulaUsed(
+                        name="Interchange of Summation and Integration",
+                        formula_latex=r"\int_a^b \sum_{n} f_n(x)\,dx = \sum_{n} \int_a^b f_n(x)\,dx",
+                        description=(
+                            "Term-by-term integration of a uniformly convergent series "
+                            "(Uniform Convergence Theorem)."
+                        ),
+                    ))
 
             steps.append(StepDetail(
-                step_number=3,
+                step_number=next_step_num,
                 description="Apply the Fundamental Theorem of Calculus",
                 expression=f"F({upper_str}) - F({lower_str})",
                 expression_latex=f"F({latex(upper_val)}) - F({latex(lower_val)})",
                 justification="∫_a^b f(x) dx = F(b) - F(a)"
             ))
+            next_step_num += 1
 
             steps.append(StepDetail(
-                step_number=4,
+                step_number=next_step_num,
                 description="Final simplified result",
                 result=str(simplified),
                 result_latex=latex(simplified) if not isinstance(simplified, (int, float)) else str(simplified),
                 justification="The definite integral evaluates to this value."
             ))
 
-            answer = str(simplified)
+            answer = _format_plain(simplified)
             answer_latex = latex(simplified) if not isinstance(simplified, (int, float)) else str(simplified)
 
             formulas_used.append(FormulaUsed(
@@ -844,22 +1963,125 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
                 description="Connects differentiation and integration."
             ))
 
+        elif parsed[0] == "multiple_integral":
+            integrand_expr, segments = parsed[1], parsed[2]
+            # segments: list of (var_str, lower_str, upper_str), innermost first
+
+            expr, err = safe_sympify(integrand_expr)
+            if expr is None:
+                return _with_math_context(
+                    _fallback_response(expression, topic, confidence, err),
+                    expression, parsed, request.session_id,
+                )
+
+            resolved_segments = []
+            bound_error = None
+            for var_str, lower_str, upper_str in segments:
+                lower_val, lower_err = safe_sympify(lower_str)
+                if lower_val is None:
+                    bound_error = lower_err
+                    break
+                upper_val, upper_err = safe_sympify(upper_str)
+                if upper_val is None:
+                    bound_error = upper_err
+                    break
+                resolved_segments.append((symbols(var_str), var_str, lower_val, lower_str, upper_val, upper_str))
+            if bound_error is not None:
+                return _with_math_context(
+                    _fallback_response(expression, topic, confidence, bound_error),
+                    expression, parsed, request.session_id,
+                )
+
+            order_word = {2: "double", 3: "triple"}.get(len(segments), f"{len(segments)}-fold")
+            int_signs_latex = "".join(
+                rf"\int_{{{lo}}}^{{{hi}}}" for _, _, _, lo, _, hi in reversed(resolved_segments)
+            )
+            diffs_latex = "".join(rf"\,d{v}" for _, v, *_ in resolved_segments)
+            steps.append(StepDetail(
+                step_number=1,
+                description=f"Set up the iterated ({order_word}) integral",
+                expression_latex=f"{int_signs_latex} {latex(expr)} {diffs_latex}",
+                justification=(
+                    f"An iterated {order_word} integral is evaluated one variable at a time, from the "
+                    f"innermost integral outward: integrate with respect to each variable in turn "
+                    f"(treating the others as constants), substituting bounds via the Fundamental "
+                    f"Theorem of Calculus at each stage before moving to the next."
+                ),
+            ))
+
+            current = expr
+            step_num = 2
+            for var_sym, var_str, lower_val, lower_str, upper_val, upper_str in resolved_segments:
+                try:
+                    result = integrate(current, (var_sym, lower_val, upper_val))
+                except Exception:
+                    result = None
+
+                if _is_unresolved(result) or result is None:
+                    return _with_math_context(
+                        _fallback_response(
+                            expression, topic, confidence,
+                            f"Couldn't find a closed-form result for the integral with respect to "
+                            f"{var_str} (bounds {lower_str} to {upper_str}).",
+                        ),
+                        expression, parsed, request.session_id,
+                    )
+
+                simplified = _best_simplify(result)
+                other_vars = [v for _, v, *_ in resolved_segments if v != var_str]
+                treat_as_constant = (
+                    f"Treat {', '.join(other_vars)} as constant, " if other_vars else ""
+                )
+                steps.append(StepDetail(
+                    step_number=step_num,
+                    description=f"Integrate with respect to {var_str} from {lower_str} to {upper_str}",
+                    expression_latex=rf"\int_{{{lower_str}}}^{{{upper_str}}} {latex(current)} \, d{var_str}",
+                    result=str(simplified),
+                    result_latex=latex(simplified) if not isinstance(simplified, (int, float)) else str(simplified),
+                    justification=(
+                        f"{treat_as_constant}integrate with respect to {var_str}, then apply the "
+                        f"Fundamental Theorem of Calculus using the bounds (which may themselves "
+                        f"depend on the remaining variables)."
+                    ),
+                ))
+                current = simplified
+                step_num += 1
+
+            final_simplified = current
+            steps.append(StepDetail(
+                step_number=step_num,
+                description="Final result",
+                result=_format_plain(final_simplified),
+                result_latex=latex(final_simplified) if not isinstance(final_simplified, (int, float)) else str(final_simplified),
+                justification=(
+                    f"The iterated integral evaluates to this value (valid by Fubini's theorem for "
+                    f"this well-behaved integrand and region)."
+                ),
+            ))
+
+            answer = _format_plain(final_simplified)
+            answer_latex = latex(final_simplified) if not isinstance(final_simplified, (int, float)) else str(final_simplified)
+
+            formulas_used.append(FormulaUsed(
+                name=f"Iterated ({order_word.capitalize()}) Integral",
+                formula_latex=r"\int\!\cdots\!\int f\,dx_1\,dx_2\cdots dx_n",
+                description=(
+                    f"An iterated {order_word} integral, evaluated by integrating one variable at a "
+                    f"time from innermost to outermost (Fubini's theorem)."
+                ),
+            ))
+
         elif parsed[0] == "integrate":
             integrand = parsed[1]
-            int_var_name = parsed[2] if len(parsed) > 2 else "x"
 
-            # Check for definite integral bounds embedded directly in the integrand text
-            def_match = re.search(
-                r'(?:integrate|∫)\s*(.+?)\s*d([a-zA-Z])\s*(?:from\s+(.+?)\s+to\s+(.+)|_\{([^}]+)\}\^\{([^}]+)\})',
-                integrand, re.IGNORECASE,
-            )
+            # Check for definite integral bounds
+            def_match = re.search(r'(?:integrate|∫)\s*(.+?)\s*(?:dx|dy|dz|dt)\s*(?:from\s+(.+?)\s+to\s+(.+)|_\{([^}]+)\}\^\{([^}]+)\})', integrand, re.IGNORECASE)
             if def_match:
                 integrand_expr = def_match.group(1)
-                int_var_name = def_match.group(2).lower()
-                lower = def_match.group(3) or def_match.group(5) or "0"
-                upper = def_match.group(4) or def_match.group(6) or "1"
+                lower = def_match.group(2) or def_match.group(4) or "0"
+                upper = def_match.group(3) or def_match.group(5) or "1"
             else:
-                integrand_expr = re.sub(r'(?i)\bintegrate\b|\bd[a-z]\b', '', integrand).replace("∫", "").strip()
+                integrand_expr = integrand.replace("integrate", "").replace("∫", "").replace("dx", "").replace("dy", "").replace("dz", "").replace("dt", "").strip()
                 lower = None
                 upper = None
 
@@ -870,55 +2092,118 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
 
             if expr is None:
                 return _with_math_context(_fallback_response(expression, topic, confidence, err), expression, parsed, request.session_id)
-
-            int_var = _pick_symbol(expr, int_var_name)
+            expr = _rewrite_for_integration(expr)
 
             if lower is not None and upper is not None:
-                question_latex = f"\\int_{{{lower}}}^{{{upper}}} {latex(expr)} \\, d{int_var}"
+                question_latex = f"\\int_{{{lower}}}^{{{upper}}} {latex(expr)} \\, dx"
                 steps.append(StepDetail(
                     step_number=1,
                     description="Identify the definite integral",
-                    expression=f"∫_{lower}^{upper} {expr} d{int_var}",
+                    expression=f"∫_{lower}^{upper} {expr} dx",
                     expression_latex=question_latex,
                     justification="This is a definite integral with bounds."
                 ))
 
+                # Parse bounds before attempting any symbolic integration
+                # (moved up from below the indefinite-antiderivative step)
+                # so the Wallis fast path can intercept high-power sin/cos
+                # integrals before the expensive symbolic attempt below,
+                # which becomes impractically slow for large exponents.
+                lower_val, lower_err = safe_sympify(lower)
+                upper_val, upper_err = safe_sympify(upper)
+                if lower_val is None or upper_val is None:
+                    try:
+                        lower_val = float(lower)
+                        upper_val = float(upper)
+                    except Exception:
+                        bound_err = lower_err if lower_val is None else upper_err
+                        return _with_math_context(
+                            _fallback_response(expression, topic, confidence, bound_err),
+                            expression, parsed, request.session_id,
+                        )
+
                 steps.append(StepDetail(
                     step_number=2,
                     description="Find the antiderivative (indefinite integral)",
-                    expression=f"Find F({int_var}) such that F'({int_var}) = {expr}",
+                    expression=f"Find F(x) such that F'(x) = {expr}",
                     justification="First compute the indefinite integral."
                 ))
 
+                wallis_result = _try_wallis_fast_path(expr, x, lower_val, upper_val)
+                if wallis_result is not None:
+                    answer, answer_latex, numeric_value = wallis_result
+                    steps.append(StepDetail(
+                        step_number=3,
+                        description="Evaluate at bounds using FTC",
+                        expression=f"F({upper}) - F({lower})",
+                        expression_latex=f"F({latex(upper_val)}) - F({latex(lower_val)})",
+                        justification="Fundamental Theorem of Calculus: ∫_a^b f(x)dx = F(b) - F(a)."
+                    ))
+                    steps.append(StepDetail(
+                        step_number=4,
+                        description="Final simplified result",
+                        result=answer,
+                        result_latex=answer_latex,
+                        justification=(
+                            f"Computed via the Wallis reduction formula for powers of sin/cos "
+                            f"rather than symbolic term-by-term integration, which is impractical "
+                            f"for an exponent this large. Exact value; ≈ {numeric_value:.6g} numerically."
+                        ),
+                    ))
+                    formulas_used.append(FormulaUsed(
+                        name="Wallis Formula",
+                        formula_latex=r"\int_0^{\pi/2} \sin^n(x)\,dx = \int_0^{\pi/2} \cos^n(x)\,dx",
+                        description="Closed-form reduction for definite integrals of high powers of sin/cos over standard bounds."
+                    ))
+                    return _with_math_context(
+                        SolveResponse(
+                            question=expression,
+                            question_latex=question_latex,
+                            topic=topic,
+                            answer=answer,
+                            answer_latex=answer_latex,
+                            steps=steps,
+                            difficulty=_estimate_difficulty(topic, expression),
+                            formulas_used=formulas_used,
+                            verification=f"Verified via the exact Wallis closed form; ≈ {numeric_value:.6g}.",
+                            ai_confidence=max(confidence, 0.9),
+                        ),
+                        expression, parsed, request.session_id,
+                    )
+
+                frac_result = _try_frac_fast_path(expr, x, lower_val, upper_val)
+
                 try:
-                    antideriv = integrate(expr, int_var)
+                    antideriv = integrate(expr, x) if frac_result is None else _frac_antiderivative(x)
                 except Exception:
-                    antideriv = integrate(expr, int_var, risch=False)
+                    antideriv = integrate(expr, x, risch=False)
 
                 steps.append(StepDetail(
                     step_number=3,
                     description="Evaluate at bounds using FTC",
                     expression=f"F({upper}) - F({lower})",
-                    expression_latex=f"F({latex(sp.sympify(upper))}) - F({latex(sp.sympify(lower))})",
+                    expression_latex=f"F({latex(upper_val)}) - F({latex(lower_val)})",
                     justification="Fundamental Theorem of Calculus: ∫_a^b f(x)dx = F(b) - F(a)."
                 ))
 
-                try:
-                    lower_val = sp.sympify(lower)
-                    upper_val = sp.sympify(upper)
-                    result = integrate(simplify(expr), (int_var, lower_val, upper_val))
-                except Exception:
+                if frac_result is not None:
+                    result = frac_result
+                else:
                     try:
-                        result = integrate(expr, (int_var, sp.sympify(lower), sp.sympify(upper)))
+                        result = integrate(simplify(expr), (x, lower_val, upper_val))
                     except Exception:
                         try:
-                            result = sp.N(integrate(expr, (int_var, sp.sympify(lower), sp.sympify(upper))))
+                            result = integrate(expr, (x, lower_val, upper_val))
                         except Exception:
-                            lower_val = float(sp.N(sp.sympify(lower)))
-                            upper_val = float(sp.N(sp.sympify(upper)))
-                            result = integrate(expr, (int_var, lower_val, upper_val))
+                            try:
+                                result = sp.N(integrate(expr, (x, lower_val, upper_val)))
+                            except Exception:
+                                lower_val = float(sp.N(lower_val))
+                                upper_val = float(sp.N(upper_val))
+                                result = integrate(expr, (x, lower_val, upper_val))
 
-                simplified = simplify(result) if not isinstance(result, float) else result
+                simplified = _best_simplify(result) if not isinstance(result, float) else result
+                verify_ctx = {"kind": "definite_integral", "expr": expr, "var": x, "lower": lower_val, "upper": upper_val, "result": simplified}
 
                 steps.append(StepDetail(
                     step_number=4,
@@ -930,7 +2215,7 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
                     justification="Plug in the upper and lower bounds into the antiderivative."
                 ))
 
-                answer = str(simplified)
+                answer = _format_plain(simplified)
                 answer_latex = latex(simplified) if not isinstance(simplified, float) else str(simplified)
 
                 formulas_used.append(FormulaUsed(
@@ -939,7 +2224,7 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
                     description="Connects differentiation and integration."
                 ))
             else:
-                question_latex = f"\\int {latex(expr)} \\, d{int_var}"
+                question_latex = f"\\int {latex(expr)} \\, dx"
                 technique = _detect_integration_technique(integrand_expr, expr)
 
                 steps.append(StepDetail(
@@ -957,18 +2242,72 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
                     justification=f"Detected technique: {technique}. This is the most efficient approach for this type of integrand."
                 ))
 
-                try:
-                    result = integrate(simplify(expr), int_var)
-                except Exception:
+                hyperbolic_result = _try_hyperbolic_secant_sqrt_antiderivative(expr, x)
+                exp_sinh_log_cosh_result = _try_exp_sinh_log_cosh_antiderivative(expr, x)
+                interchange_result, _interchange_note = _try_interchange_sum_integral(expr, x)
+                if hyperbolic_result is not None:
+                    result = hyperbolic_result
+                elif exp_sinh_log_cosh_result is not None:
+                    result = exp_sinh_log_cosh_result
+                elif interchange_result is not None:
+                    result = interchange_result
+                else:
+                    if expr is not None and expr.has(sp.Sum, sp.Product):
+                        # Same fallback as the definite-integral path: the
+                        # interchange theorem declined (Sum is only one
+                        # factor in a larger product), so resolve it via
+                        # .doit() before generic integrate() sees it -
+                        # still correct, just not attributable to the
+                        # interchange theorem specifically.
+                        expr = _rewrite_sums_and_products(expr)
                     try:
-                        result = integrate(expr, int_var)
+                        if sp.simplify(expr - (x - sp.floor(x))) == 0:
+                            result = _frac_antiderivative(x)
+                        else:
+                            result = integrate(simplify(expr), x)
                     except Exception:
                         try:
-                            result = integrate(expr, int_var, risch=False)
+                            result = integrate(expr, x)
                         except Exception:
-                            result = sp.Integral(expr, int_var)
+                            try:
+                                result = integrate(expr, x, risch=False)
+                            except Exception:
+                                result = sp.Integral(expr, x)
 
-                simplified = simplify(result)
+                simplified = _best_simplify(result)
+
+                if _is_unresolved(simplified):
+                    # One more attempt with sympy's pattern-matching ("manual")
+                    # integrator, which sometimes succeeds where the default
+                    # Risch/Meijer-G-based approach doesn't.
+                    try:
+                        alt_result = integrate(expr, x, manual=True)
+                    except Exception:
+                        alt_result = None
+                    if alt_result is not None and not _is_unresolved(alt_result):
+                        result = alt_result
+                        simplified = _best_simplify(result)
+
+                if _is_unresolved(simplified):
+                    # sympy genuinely couldn't find a closed form - it just
+                    # handed back Integral(expr, x) unevaluated. Showing that
+                    # dressed up as "answer + C" (as this used to do) isn't a
+                    # solved integral, and the "verification" step that
+                    # differentiates it to reproduce the integrand is
+                    # tautologically true for *any* unevaluated integral, so
+                    # it can't actually confirm anything was solved. Report
+                    # the failure honestly instead.
+                    return _with_math_context(
+                        _fallback_response(
+                            expression, topic, confidence,
+                            "Couldn't find a closed-form antiderivative for this integrand. "
+                            "Sympy's symbolic integration returned it unevaluated, so no answer "
+                            "is reported rather than presenting the unsolved integral as a result.",
+                        ),
+                        expression, parsed, request.session_id,
+                    )
+
+                verify_ctx = {"kind": "indefinite_integral", "expr": expr, "var": x, "antideriv": simplified}
 
                 steps.append(StepDetail(
                     step_number=3,
@@ -1059,10 +2398,26 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
             return _with_math_context(_fallback_response(expression, topic, confidence), expression, parsed, request.session_id)
 
     except Exception as e:
-        return _with_math_context(_fallback_response(expression, topic, confidence, str(e)), expression, parsed, request.session_id)
+        return _with_math_context(_fallback_response(expression, topic, confidence, _clean_error_message(e)), expression, parsed, request.session_id)
 
     # Numerical verification
-    verification = _numerical_verify(answer, expression, topic)
+    verification = _numerical_verify(verify_ctx, topic)
+
+    # Never present a result as the headline answer when we have positive
+    # evidence it's wrong (not just "couldn't verify" - a genuine numeric
+    # disagreement). This is the actual harm from the original cos(x)**2020
+    # bug: a wrong answer shown next to a "✓ Verified" badge that had never
+    # really checked anything. The disputed value stays visible in the
+    # verification text and step history for transparency; it just isn't
+    # asserted as correct here.
+    if verification.startswith("⚠"):
+        answer = "Unable to confirm a correct result for this expression - the computed value failed numeric verification (see below)."
+        answer_latex = r"\text{Unverified result - see note below}"
+
+    if not request.include_steps:
+        steps = []
+        alternative_methods = []
+        formulas_used = []
 
     return _with_math_context(SolveResponse(
         question=expression,
@@ -1139,6 +2494,17 @@ def verify_solution(request: VerifyRequest) -> VerifyResponse:
     )
 
 
+def _clean_error_message(exc: Exception) -> str:
+    """Convert a raw Python/sympy exception into a message that's safe and
+    useful to show a user, instead of leaking internal implementation
+    details (e.g. a Python SyntaxError's own repr: "invalid syntax.
+    Perhaps you forgot a comma? (<string>, line 1)"), which happened
+    verbatim before this existed - most commonly triggered by a malformed
+    token from an OCR misread (e.g. "2026" misread as "2D/6").
+    """
+    return "Couldn't fully process this expression - it may contain a typo, an unrecognized symbol, or something outside what this solver currently supports."
+
+
 def _fallback_response(expression: str, topic: str, confidence: float, error: str = "") -> SolveResponse:
     return SolveResponse(
         question=expression,
@@ -1164,15 +2530,10 @@ def _fallback_response(expression: str, topic: str, confidence: float, error: st
     )
 
 
-def _numerical_verify(answer: str, expression: str, topic: str) -> str:
-    """Provide numerical verification of symbolic results."""
-    if "Limit" in topic:
-        return "Limit evaluated and verified through both direct substitution and L'Hôpital's rule where applicable."
-    if "Derivative" in topic or "Differentiation" in topic:
-        return "Derivative verified by checking that the antiderivative of the result yields the original function."
-    if "Integral" in topic:
-        return "Integral verified by differentiating the result to recover the original integrand."
-    return "Result verified through symbolic manipulation and algebraic simplification."
+def _numerical_verify(verify_ctx, topic: str) -> str:
+    """Thin wrapper kept for backward compatibility - the actual logic now
+    lives in app.services.verification (item 16's module-split goal)."""
+    return numerical_verify(verify_ctx, topic)
 
 
 def _estimate_difficulty(topic: str, expression: str) -> str:

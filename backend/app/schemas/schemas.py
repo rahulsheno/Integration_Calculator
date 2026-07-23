@@ -49,6 +49,12 @@ class SolveRequest(BaseModel):
     expression: str = Field(..., description="Mathematical expression in LaTeX or plain text")
     topic_hint: Optional[str] = Field(None, description="Optional topic hint")
     include_graph: bool = Field(True, description="Include graph if applicable")
+    include_steps: bool = Field(
+        True,
+        description="Include step-by-step explanation, formulas, and alternative methods in the "
+        "response. Defaults to True to match existing behavior; set False for a lighter, "
+        "answer-only response when the caller doesn't need the full walkthrough.",
+    )
     session_id: Optional[str] = Field(None, description="Optional conversation/session id")
 
 

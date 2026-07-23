@@ -1,5 +1,6 @@
 import copy
 import csv
+import hashlib
 import io
 import json
 import math
@@ -18,6 +19,16 @@ from app.schemas.schemas import (
 )
 
 router = APIRouter(prefix="/questions", tags=["Questions"])
+
+
+def _compute_content_hash(question_text: str) -> str:
+    """Hash of the normalized question text, used to detect duplicate saves
+    (item 17: avoid storing the same solved question repeatedly). Normalizes
+    whitespace and case so trivially different formatting of the same
+    question still hashes the same.
+    """
+    normalized = " ".join(question_text.strip().lower().split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def _question_to_response(q: Question, collection_name: str | None = None) -> QuestionResponse:
@@ -179,6 +190,21 @@ async def get_question(question_id: str, db: AsyncSession = Depends(get_db)):
 
 @router.post("", response_model=QuestionResponse, status_code=201)
 async def create_question(data: QuestionCreate, db: AsyncSession = Depends(get_db)):
+    content_hash = _compute_content_hash(data.question)
+
+    # Avoid storing the same solved question repeatedly in the same
+    # collection - if it's already there, just return the existing row
+    # rather than creating a duplicate.
+    existing_result = await db.execute(
+        select(Question).where(
+            Question.content_hash == content_hash,
+            Question.collection_id == data.collection_id,
+        )
+    )
+    existing = existing_result.scalar_one_or_none()
+    if existing is not None:
+        return _question_to_response(existing)
+
     q = Question(
         question=data.question,
         question_latex=data.question_latex,
@@ -194,6 +220,7 @@ async def create_question(data: QuestionCreate, db: AsyncSession = Depends(get_d
         graph_data=data.graph_data.model_dump() if data.graph_data else None,
         notes=data.notes,
         collection_id=data.collection_id,
+        content_hash=content_hash,
     )
     db.add(q)
     await db.flush()
@@ -263,6 +290,7 @@ async def duplicate_question(question_id: str, db: AsyncSession = Depends(get_db
         graph_data=copy.deepcopy(q.graph_data),
         notes=q.notes,
         collection_id=q.collection_id,
+        content_hash=_compute_content_hash(f"{q.question} (copy)"),
     )
     db.add(new_q)
     await db.flush()
@@ -330,7 +358,21 @@ async def bulk_tag(data: BulkTagRequest, db: AsyncSession = Depends(get_db)):
 @router.post("/import")
 async def import_questions(data: ImportRequest, db: AsyncSession = Depends(get_db)):
     imported = 0
+    skipped_duplicates = 0
     for q_data in data.questions:
+        target_collection_id = data.collection_id or q_data.collection_id
+        content_hash = _compute_content_hash(q_data.question)
+
+        existing_result = await db.execute(
+            select(Question).where(
+                Question.content_hash == content_hash,
+                Question.collection_id == target_collection_id,
+            )
+        )
+        if existing_result.scalar_one_or_none() is not None:
+            skipped_duplicates += 1
+            continue
+
         q = Question(
             question=q_data.question,
             question_latex=q_data.question_latex,
@@ -345,11 +387,15 @@ async def import_questions(data: ImportRequest, db: AsyncSession = Depends(get_d
             ai_confidence=q_data.ai_confidence,
             graph_data=q_data.graph_data.model_dump() if q_data.graph_data else None,
             notes=q_data.notes,
-            collection_id=data.collection_id or q_data.collection_id,
+            collection_id=target_collection_id,
+            content_hash=content_hash,
         )
         db.add(q)
         imported += 1
-    return {"message": f"Imported {imported} questions"}
+    message = f"Imported {imported} questions"
+    if skipped_duplicates:
+        message += f" ({skipped_duplicates} duplicate{'s' if skipped_duplicates != 1 else ''} skipped)"
+    return {"message": message, "imported": imported, "skipped_duplicates": skipped_duplicates}
 
 
 @router.post("/import/file")
@@ -360,38 +406,55 @@ async def import_file(
 ):
     content = await file.read()
     imported = 0
+    skipped_duplicates = 0
+
+    async def _add_if_new(question_text: str, target_collection_id, **fields):
+        nonlocal imported, skipped_duplicates
+        if not question_text:
+            return
+        content_hash = _compute_content_hash(question_text)
+        existing_result = await db.execute(
+            select(Question).where(
+                Question.content_hash == content_hash,
+                Question.collection_id == target_collection_id,
+            )
+        )
+        if existing_result.scalar_one_or_none() is not None:
+            skipped_duplicates += 1
+            return
+        db.add(Question(question=question_text, collection_id=target_collection_id, content_hash=content_hash, **fields))
+        imported += 1
 
     if file.filename.endswith(".json"):
         data = json.loads(content)
         questions_data = data if isinstance(data, list) else data.get("questions", [])
         for item in questions_data:
-            q = Question(
-                question=item.get("question", ""),
+            await _add_if_new(
+                item.get("question", ""),
+                collection_id or item.get("collection_id"),
                 answer=item.get("answer", ""),
                 topic=item.get("topic"),
                 difficulty=item.get("difficulty"),
                 tags=item.get("tags", []),
                 steps=item.get("steps", []),
                 notes=item.get("notes"),
-                collection_id=collection_id or item.get("collection_id"),
             )
-            db.add(q)
-            imported += 1
     elif file.filename.endswith(".csv"):
         reader = csv.DictReader(io.StringIO(content.decode()))
         for row in reader:
-            q = Question(
-                question=row.get("question", ""),
+            await _add_if_new(
+                row.get("question", ""),
+                collection_id,
                 answer=row.get("answer", ""),
                 topic=row.get("topic"),
                 difficulty=row.get("difficulty"),
                 tags=row.get("tags", "").split(",") if row.get("tags") else [],
-                collection_id=collection_id,
             )
-            db.add(q)
-            imported += 1
 
-    return {"message": f"Imported {imported} questions"}
+    message = f"Imported {imported} questions"
+    if skipped_duplicates:
+        message += f" ({skipped_duplicates} duplicate{'s' if skipped_duplicates != 1 else ''} skipped)"
+    return {"message": message, "imported": imported, "skipped_duplicates": skipped_duplicates}
 
 
 @router.get("/export/format")

@@ -32,6 +32,18 @@ def numeric_quad(expr, var, lower_val, upper_val):
     """
     import mpmath as mp
 
+    # An unevaluated Sum/Product (e.g. from an integrand like
+    # "Sum(x**n, (n, 2, oo))") lambdifies into raw Python sum()/range(),
+    # which can't handle an infinite bound at all ("range(2, oo+1)" is
+    # nonsensical) and throws deep inside mpmath's quadrature loop. Forcing
+    # evaluation first collapses it to a closed form (here, a Piecewise
+    # with x**2/(1-x) on the convergent region) that lambdifies normally.
+    # A no-op for expressions with nothing to evaluate.
+    try:
+        expr = expr.doit()
+    except Exception:
+        pass
+
     f = sp.lambdify(var, expr, modules=["mpmath"])
     lo = mp.mpf(sp.N(lower_val))
     hi = mp.mpf(sp.N(upper_val))
@@ -126,6 +138,10 @@ def numerical_verify(verify_ctx, topic: str) -> str:
 
         if kind == "indefinite_integral":
             expr, var, antideriv = verify_ctx["expr"], verify_ctx["var"], verify_ctx["antideriv"]
+            try:
+                expr = expr.doit()
+            except Exception:
+                pass
             deriv_of_result = sp.diff(antideriv, var)
             sample_points = [0.3, 0.7, 1.3, -0.6, 2.1]
             f_expr = sp.lambdify(var, expr, modules=["mpmath"])
@@ -154,6 +170,10 @@ def numerical_verify(verify_ctx, topic: str) -> str:
 
         if kind == "derivative":
             expr, var, result = verify_ctx["expr"], verify_ctx["var"], verify_ctx["result"]
+            try:
+                expr = expr.doit()
+            except Exception:
+                pass
             f_expr = sp.lambdify(var, expr, modules=["mpmath"])
             f_result = sp.lambdify(var, result, modules=["mpmath"])
             sample_points = [0.3, 0.7, 1.3, -0.6, 2.1]

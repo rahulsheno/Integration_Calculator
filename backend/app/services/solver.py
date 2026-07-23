@@ -201,6 +201,32 @@ def parse_expression(expr_str: str):
     if m:
         return "differentiate", m.group(1).strip()
 
+    # Check for an iterated (multiple, i.e. double/triple/...) integral:
+    # "integrate f dx from a to b dy from c to d ..." - the canonical
+    # plain-text form math_ocr's multiple-integral LaTeX extractor
+    # produces, with segments ordered innermost-to-outermost. Must be
+    # checked before the generic single-integral dispatch below, which
+    # doesn't know how to handle more than one "from ... to ..." pair.
+    # Variable names may be a single letter (dx, dy, ...) or a subscripted
+    # identifier (dx_1, dx_10, ...) for genuinely high-dimensional problems.
+    m = re.match(
+        r'integrate\s+(.+?)\s+((?:d[a-zA-Z][a-zA-Z0-9_]*\s+from\s+.+?\s+to\s+.+?\s*)+)$',
+        expr_str, re.IGNORECASE,
+    )
+    if m:
+        integrand, segments_blob = m.groups()
+        segments = re.findall(
+            r'd([a-zA-Z][a-zA-Z0-9_]*)\s+from\s+(.+?)\s+to\s+(.+?)(?=\s+d[a-zA-Z][a-zA-Z0-9_]*\s+from\s+|\s*$)',
+            segments_blob, re.IGNORECASE,
+        )
+        if len(segments) >= 2:
+            # segments[0] is innermost (integrated first), segments[-1] is
+            # outermost (integrated last) - each a (var, lower, upper) triple.
+            return (
+                "multiple_integral", integrand.strip(),
+                [(v, lo.strip(), hi.strip()) for v, lo, hi in segments],
+            )
+
     # Check if we should treat it as an integration
     is_integral = ('integrate' in expr_str.lower() or 
                    'integral' in expr_str.lower() or 
@@ -361,6 +387,7 @@ def safe_sympify(expr_str: str):
             'coth': sp.coth, 'sech': sp.sech, 'csch': sp.csch,
             'asinh': sp.asinh, 'acosh': sp.acosh, 'atanh': sp.atanh,
             'arcsin': sp.asin, 'arccos': sp.acos, 'arctan': sp.atan,
+            'arcsinh': sp.asinh, 'arccosh': sp.acosh, 'arctanh': sp.atanh,
             'ln': log, 'log': log, 'exp': exp, 'sqrt': sqrt, 'abs': sp.Abs, 'Abs': sp.Abs,
             'max': sp.Max, 'Max': sp.Max, 'min': sp.Min, 'Min': sp.Min,
             'frac': lambda a: a - sp.floor(a),
@@ -580,6 +607,36 @@ def _rewrite_sqrt_half_angle(expr):
     return expr
 
 
+def _rewrite_sums_and_products(expr):
+    """Evaluate any Sum/Product subexpressions (e.g. a series nested inside
+    a larger integrand, like "integrate (sum x^n from n=2 to oo) dx") via
+    .doit() before integration is attempted.
+
+    Without this, a Sum/Product buried inside an integrand is never given
+    to integrate() as anything simpler than itself - integrate() then just
+    returns an unevaluated Integral(Sum(...), ...), and the ONLY reason the
+    solver produces any answer at all for such cases is that its numeric
+    fallback (sp.N() on the unevaluated result) happens to be able to push
+    straight through both the Integral and the Sum simultaneously. That
+    numeric-only path can never surface a symbolic closed form or a
+    step-by-step derivation - replacing Sum(x**n, (n, 2, oo)) with its
+    closed form (x**2/(1-x)) up front lets integrate() actually work with
+    a plain rational/algebraic expression, so it can find (and show) a
+    genuine symbolic antiderivative when one exists.
+    """
+    if expr is None:
+        return expr
+    try:
+        if not expr.has(sp.Sum, sp.Product):
+            return expr
+        return expr.replace(
+            lambda node: isinstance(node, (sp.Sum, sp.Product)),
+            lambda node: node.doit(),
+        )
+    except Exception:
+        return expr
+
+
 def _rewrite_for_integration(expr):
     """Rewrite Abs/Max/Min nodes into Piecewise before integration.
 
@@ -588,6 +645,22 @@ def _rewrite_for_integration(expr):
     smooth/differentiable everywhere. Converting to the equivalent Piecewise
     form up front lets integrate() split the domain and integrate each
     branch, which it already knows how to do correctly.
+
+    Note: a Sum/Product nested in the integrand is deliberately NOT
+    resolved here. That used to be handled by unconditionally calling
+    .doit() on any Sum/Product found, before integration - mathematically
+    valid, but it silently pre-empts _try_interchange_sum_integral (which
+    runs later, in _integrate_definite_with_fallbacks and the indefinite
+    branch) from ever seeing a Sum to interchange, so the derivation would
+    never actually cite the Interchange of Summation and Integration
+    theorem - it would just look, from the outside, like the Sum was never
+    there. Leaving Sum/Product untouched here lets the properly-justified
+    technique run first; only if that declines (e.g. because the Sum is
+    just one factor in a larger product, like x*Sum(...), where naively
+    integrating termwise would misapply the theorem) does the generic
+    integrate() call see the unresolved Sum and fall through to an
+    unevaluated Integral - which is safe (matches "no answer" rather than
+    a wrong one) but not what the common case reaching here needs.
     """
     if expr is None:
         return expr
@@ -1102,6 +1175,105 @@ def _wallis_quarter_period_numeric(m: int, n: int) -> float:
     return value
 
 
+def _try_interchange_sum_integral(expr, x_symbol, lower_val=None, upper_val=None):
+    """Term-by-term integration via the Interchange of Summation and
+    Integration theorem (also called term-by-term integration of a
+    uniformly convergent series):
+
+        indefinite:  ∫ Σₙ fₙ(x) dx = Σₙ ∫ fₙ(x) dx
+        definite:    ∫ₐᵇ Σₙ fₙ(x) dx = Σₙ ∫ₐᵇ fₙ(x) dx
+
+    This is justified by the Uniform Convergence Theorem whenever the
+    series converges uniformly on the interval of integration - the
+    textbook example this handles is a power series integrated over a
+    closed sub-interval strictly inside its radius of convergence (e.g.
+    a geometric series), which always converges uniformly there.
+
+    Rather than resolving a Sum found inside the integrand via .doit()
+    and then integrating whatever falls out (mathematically valid, but
+    opaque about *why* it's valid and unable to show a genuine
+    term-by-term derivation), this integrates the summand directly and
+    re-sums the result - the actual textbook technique, with a citation
+    of the theorem that justifies it.
+
+    Returns (result, justification) if a single Sum is found and the
+    term-by-term integral resolves to a closed form, or (None, None)
+    otherwise (including when the Sum is only one factor in a larger
+    product with other x-dependence, e.g. x*Sum(...) - naively pulling
+    the sum out and integrating termwise would silently misapply the
+    theorem there, so that case is left to the .doit()-first fallback in
+    _rewrite_sums_and_products instead, which is still correct, just less
+    illustrative of the theorem itself).
+    """
+    if expr is None:
+        return None, None
+    try:
+        if not expr.has(sp.Sum):
+            return None, None
+        sums_found = list(expr.atoms(sp.Sum))
+    except Exception:
+        return None, None
+    if len(sums_found) != 1:
+        return None, None
+
+    the_sum = sums_found[0]
+    if len(the_sum.limits) != 1:
+        return None, None
+
+    try:
+        placeholder = sp.Dummy("interchange_sum_placeholder")
+        without_sum = expr.subs(the_sum, placeholder)
+        if without_sum.has(x_symbol):
+            # Some other factor besides the_sum still depends on x_symbol
+            # (e.g. x*Sum(...)) - as_independent() alone won't catch this,
+            # since it checks whether a factor structurally contains
+            # the_sum as a literal subexpression, not whether it shares
+            # free symbols with it. "x" doesn't contain the_sum, so it was
+            # previously (incorrectly) treated as an independent constant
+            # coefficient - silently misapplying the theorem and returning
+            # a wrong, still-x-dependent "answer" for what should have been
+            # a plain number (a definite integral). Bail out here instead.
+            return None, None
+        coeff = without_sum.subs(placeholder, 1)
+    except Exception:
+        return None, None
+
+    summation_var, n_lower, n_upper = the_sum.limits[0]
+    summand = the_sum.function
+
+    try:
+        if lower_val is not None and upper_val is not None:
+            term_integral = sp.integrate(summand, (x_symbol, lower_val, upper_val))
+        else:
+            term_integral = sp.integrate(summand, x_symbol)
+    except Exception:
+        return None, None
+    if term_integral is None or term_integral.has(sp.Integral):
+        return None, None
+
+    try:
+        resummed = sp.Sum(term_integral, (summation_var, n_lower, n_upper)).doit()
+    except Exception:
+        return None, None
+    if resummed is None or resummed.has(sp.Sum):
+        return None, None
+
+    result = coeff * resummed
+    if lower_val is not None and upper_val is not None:
+        justification = (
+            "Interchange of Summation and Integration (term-by-term integration of a "
+            "uniformly convergent series): ∫ₐᵇ Σₙ fₙ(x) dx = Σₙ ∫ₐᵇ fₙ(x) dx. Valid here "
+            "by the Uniform Convergence Theorem, since the series converges uniformly on "
+            "the interval of integration."
+        )
+    else:
+        justification = (
+            "Interchange of Summation and Integration (term-by-term integration of a "
+            "uniformly convergent series): ∫ Σₙ fₙ(x) dx = Σₙ ∫ fₙ(x) dx."
+        )
+    return result, justification
+
+
 def _is_unresolved(value) -> bool:
     """True if `value` is missing or still contains an unevaluated Integral -
     i.e. sympy didn't actually finish the computation."""
@@ -1124,6 +1296,21 @@ def _integrate_definite_with_fallbacks(expr, x_symbol, lower_val, upper_val):
     describes which approach worked, or None if direct integration
     succeeded and no special technique was needed.
     """
+    interchange_res, interchange_note = _try_interchange_sum_integral(expr, x_symbol, lower_val, upper_val)
+    if interchange_res is not None:
+        return interchange_res, interchange_note
+
+    if expr is not None and expr.has(sp.Sum, sp.Product):
+        # The interchange theorem declined (most likely because the Sum is
+        # only one factor in a larger product with other x-dependence, e.g.
+        # x*Sum(...), where pulling the sum out and integrating termwise
+        # would silently misapply the theorem). Resolving the Sum/Product
+        # via .doit() first is still mathematically valid there - just not
+        # attributable to the interchange theorem specifically - so use it
+        # as a fallback rather than leaving integrate() to stare at a bare
+        # Sum/Product node it has no way to handle at all.
+        expr = _rewrite_sums_and_products(expr)
+
     try:
         result = integrate(simplify(expr), (x_symbol, lower_val, upper_val))
     except Exception:
@@ -1320,6 +1507,9 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
         confidence = 0.9
 
     parsed = parse_expression(expression)
+    if parsed[0] == "multiple_integral" and not request.topic_hint:
+        topic = "Multiple Integrals"
+        confidence = 0.9
     steps: list[StepDetail] = []
     alternative_methods: list[AlternativeMethod] = []
     formulas_used: list[FormulaUsed] = []
@@ -1733,10 +1923,19 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
             if technique_note:
                 steps.append(StepDetail(
                     step_number=next_step_num,
-                    description="Apply a symmetry/periodicity technique",
+                    description="Apply a specialized integration technique",
                     justification=technique_note,
                 ))
                 next_step_num += 1
+                if "Interchange of Summation and Integration" in technique_note:
+                    formulas_used.append(FormulaUsed(
+                        name="Interchange of Summation and Integration",
+                        formula_latex=r"\int_a^b \sum_{n} f_n(x)\,dx = \sum_{n} \int_a^b f_n(x)\,dx",
+                        description=(
+                            "Term-by-term integration of a uniformly convergent series "
+                            "(Uniform Convergence Theorem)."
+                        ),
+                    ))
 
             steps.append(StepDetail(
                 step_number=next_step_num,
@@ -1762,6 +1961,114 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
                 name="Fundamental Theorem of Calculus",
                 formula_latex=r"\int_a^b f(x) \, dx = F(b) - F(a)",
                 description="Connects differentiation and integration."
+            ))
+
+        elif parsed[0] == "multiple_integral":
+            integrand_expr, segments = parsed[1], parsed[2]
+            # segments: list of (var_str, lower_str, upper_str), innermost first
+
+            expr, err = safe_sympify(integrand_expr)
+            if expr is None:
+                return _with_math_context(
+                    _fallback_response(expression, topic, confidence, err),
+                    expression, parsed, request.session_id,
+                )
+
+            resolved_segments = []
+            bound_error = None
+            for var_str, lower_str, upper_str in segments:
+                lower_val, lower_err = safe_sympify(lower_str)
+                if lower_val is None:
+                    bound_error = lower_err
+                    break
+                upper_val, upper_err = safe_sympify(upper_str)
+                if upper_val is None:
+                    bound_error = upper_err
+                    break
+                resolved_segments.append((symbols(var_str), var_str, lower_val, lower_str, upper_val, upper_str))
+            if bound_error is not None:
+                return _with_math_context(
+                    _fallback_response(expression, topic, confidence, bound_error),
+                    expression, parsed, request.session_id,
+                )
+
+            order_word = {2: "double", 3: "triple"}.get(len(segments), f"{len(segments)}-fold")
+            int_signs_latex = "".join(
+                rf"\int_{{{lo}}}^{{{hi}}}" for _, _, _, lo, _, hi in reversed(resolved_segments)
+            )
+            diffs_latex = "".join(rf"\,d{v}" for _, v, *_ in resolved_segments)
+            steps.append(StepDetail(
+                step_number=1,
+                description=f"Set up the iterated ({order_word}) integral",
+                expression_latex=f"{int_signs_latex} {latex(expr)} {diffs_latex}",
+                justification=(
+                    f"An iterated {order_word} integral is evaluated one variable at a time, from the "
+                    f"innermost integral outward: integrate with respect to each variable in turn "
+                    f"(treating the others as constants), substituting bounds via the Fundamental "
+                    f"Theorem of Calculus at each stage before moving to the next."
+                ),
+            ))
+
+            current = expr
+            step_num = 2
+            for var_sym, var_str, lower_val, lower_str, upper_val, upper_str in resolved_segments:
+                try:
+                    result = integrate(current, (var_sym, lower_val, upper_val))
+                except Exception:
+                    result = None
+
+                if _is_unresolved(result) or result is None:
+                    return _with_math_context(
+                        _fallback_response(
+                            expression, topic, confidence,
+                            f"Couldn't find a closed-form result for the integral with respect to "
+                            f"{var_str} (bounds {lower_str} to {upper_str}).",
+                        ),
+                        expression, parsed, request.session_id,
+                    )
+
+                simplified = _best_simplify(result)
+                other_vars = [v for _, v, *_ in resolved_segments if v != var_str]
+                treat_as_constant = (
+                    f"Treat {', '.join(other_vars)} as constant, " if other_vars else ""
+                )
+                steps.append(StepDetail(
+                    step_number=step_num,
+                    description=f"Integrate with respect to {var_str} from {lower_str} to {upper_str}",
+                    expression_latex=rf"\int_{{{lower_str}}}^{{{upper_str}}} {latex(current)} \, d{var_str}",
+                    result=str(simplified),
+                    result_latex=latex(simplified) if not isinstance(simplified, (int, float)) else str(simplified),
+                    justification=(
+                        f"{treat_as_constant}integrate with respect to {var_str}, then apply the "
+                        f"Fundamental Theorem of Calculus using the bounds (which may themselves "
+                        f"depend on the remaining variables)."
+                    ),
+                ))
+                current = simplified
+                step_num += 1
+
+            final_simplified = current
+            steps.append(StepDetail(
+                step_number=step_num,
+                description="Final result",
+                result=_format_plain(final_simplified),
+                result_latex=latex(final_simplified) if not isinstance(final_simplified, (int, float)) else str(final_simplified),
+                justification=(
+                    f"The iterated integral evaluates to this value (valid by Fubini's theorem for "
+                    f"this well-behaved integrand and region)."
+                ),
+            ))
+
+            answer = _format_plain(final_simplified)
+            answer_latex = latex(final_simplified) if not isinstance(final_simplified, (int, float)) else str(final_simplified)
+
+            formulas_used.append(FormulaUsed(
+                name=f"Iterated ({order_word.capitalize()}) Integral",
+                formula_latex=r"\int\!\cdots\!\int f\,dx_1\,dx_2\cdots dx_n",
+                description=(
+                    f"An iterated {order_word} integral, evaluated by integrating one variable at a "
+                    f"time from innermost to outermost (Fubini's theorem)."
+                ),
             ))
 
         elif parsed[0] == "integrate":
@@ -1937,11 +2244,22 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
 
                 hyperbolic_result = _try_hyperbolic_secant_sqrt_antiderivative(expr, x)
                 exp_sinh_log_cosh_result = _try_exp_sinh_log_cosh_antiderivative(expr, x)
+                interchange_result, _interchange_note = _try_interchange_sum_integral(expr, x)
                 if hyperbolic_result is not None:
                     result = hyperbolic_result
                 elif exp_sinh_log_cosh_result is not None:
                     result = exp_sinh_log_cosh_result
+                elif interchange_result is not None:
+                    result = interchange_result
                 else:
+                    if expr is not None and expr.has(sp.Sum, sp.Product):
+                        # Same fallback as the definite-integral path: the
+                        # interchange theorem declined (Sum is only one
+                        # factor in a larger product), so resolve it via
+                        # .doit() before generic integrate() sees it -
+                        # still correct, just not attributable to the
+                        # interchange theorem specifically.
+                        expr = _rewrite_sums_and_products(expr)
                     try:
                         if sp.simplify(expr - (x - sp.floor(x))) == 0:
                             result = _frac_antiderivative(x)

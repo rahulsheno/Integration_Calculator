@@ -301,20 +301,26 @@ def normalize_latex_math(latex_text: str) -> str:
     if nested_integral:
         return nested_integral
 
+    multiple_integral = _multiple_integral_expression_from_latex(text)
+    if multiple_integral and not _has_untranslated_latex_artifacts(multiple_integral):
+        return multiple_integral
+
     integral = _integral_expression_from_latex(text)
     if integral and not _has_untranslated_latex_artifacts(integral):
         return integral
 
-    try:
-        from latex2sympy2 import latex2sympy
-
-        expr = latex2sympy(text)
-        if expr is not None:
-            result = re.sub(r"\s+", "", str(expr)).replace("**", "^")
-            if not _has_untranslated_latex_artifacts(result):
-                return result
-    except Exception:
-        pass
+    # NOTE: this used to call latex2sympy directly here, as a second,
+    # separate call site from the one inside _latex_expression_to_plain
+    # below - which meant any input that didn't match one of the more
+    # specific integral-shaped extractors above (i.e. anything falling
+    # through to this generic fallback) completely bypassed the fixes
+    # applied there (multi-digit subscript braces, bare \log defaulting to
+    # natural log instead of base 10). Routing through
+    # _latex_expression_to_plain here instead means there's only one place
+    # latex2sympy is ever called, so every fix applies everywhere uniformly.
+    generic = _latex_expression_to_plain(text)
+    if generic and not _has_untranslated_latex_artifacts(generic):
+        return generic
 
     fallback = normalize_math_ocr_text(text)
     if _has_untranslated_latex_artifacts(fallback):
@@ -418,6 +424,93 @@ def _consume_bound(text: str, pos: int) -> tuple[str | None, int]:
     return tok_match.group(0), pos + tok_match.end()
 
 
+def _multiple_integral_expression_from_latex(text: str) -> str:
+    """Recognize a nested/iterated multiple integral (double, triple, or
+    higher) of the form
+
+        \\int_{a}^{b}\\int_{c}^{d}\\int_{e}^{f} ... f(x,y,z,...) \\,dx\\,dy\\,dz...
+
+    and convert it to the canonical plain-text form (innermost integral
+    first):
+
+        "integrate f dx from e to f dy from c to d dz from a to b"
+
+    that solve_calculus's parser recognizes as a multiple_integral
+    operation, evaluated from innermost to outermost.
+
+    Convention (matching standard notation, generalized from the double-
+    integral case): each \\int sign's bounds pair with a differential at
+    the end, working from the innermost integral sign/outermost written
+    differential... concretely: the FIRST \\int's bounds pair with the
+    LAST differential written, the SECOND \\int's bounds pair with the
+    SECOND-TO-LAST differential, and so on - i.e. reading \\int signs
+    left-to-right pairs with reading differentials right-to-left. The
+    differential closest to the integrand (first one written) always
+    belongs to the innermost (last-written) integral sign.
+    """
+    bounds = []
+    pos = 0
+    while True:
+        m = re.match(r"\s*\\int\s*", text[pos:])
+        if not m:
+            break
+        pos += m.end()
+        lower_latex = upper_latex = None
+        for _ in range(2):
+            if pos < len(text) and text[pos] == "_":
+                lower_latex, pos = _consume_bound(text, pos + 1)
+            elif pos < len(text) and text[pos] == "^":
+                upper_latex, pos = _consume_bound(text, pos + 1)
+            else:
+                break
+        if lower_latex is None or upper_latex is None:
+            return ""
+        bounds.append((lower_latex, upper_latex))
+
+    num_integrals = len(bounds)
+    if num_integrals < 2:
+        # Not a multiple integral - let the single-integral path (which
+        # handles this more simply, without the "d..." x num_integrals
+        # bookkeeping below) take it instead.
+        return ""
+
+    # Each differential variable may be a single letter (dx, dy, ...) or a
+    # subscripted name in LaTeX form (dx_{1}, dx_1, ...) - needed for
+    # genuinely high-dimensional problems (x_1 through x_n) rather than
+    # being limited to 26 single-letter variable names.
+    diff_pattern = r"\s*d\s*([a-zA-Z](?:_\{?[0-9]+\}?)?)" * num_integrals
+    end_match = re.search(r"\s*(.+?)" + diff_pattern + r"\s*$", text[pos:])
+    if not end_match:
+        return ""
+
+    integrand_latex = end_match.group(1).strip()
+    # variables[0] is innermost (pairs with bounds[-1], the LAST \int
+    # encountered); variables[-1] is outermost (pairs with bounds[0]).
+    # Strip LaTeX brace syntax (x_{1} -> x_1) so the result is a clean
+    # identifier sympy accepts natively.
+    variables = [
+        end_match.group(i).replace("{", "").replace("}", "")
+        for i in range(2, 2 + num_integrals)
+    ]
+
+    integrand = _latex_expression_to_plain(integrand_latex)
+    if not _is_valid_math_fragment(integrand):
+        return ""
+
+    plain_bounds = []
+    for lower_latex, upper_latex in bounds:
+        lower = _latex_expression_to_plain(lower_latex)
+        upper = _latex_expression_to_plain(upper_latex)
+        if not (_is_valid_math_fragment(lower) and _is_valid_math_fragment(upper)):
+            return ""
+        plain_bounds.append((lower, upper))
+
+    parts = [f"integrate {integrand}"]
+    for var, (lower, upper) in zip(variables, reversed(plain_bounds)):
+        parts.append(f"d{var} from {lower} to {upper}")
+    return " ".join(parts)
+
+
 def _integral_expression_from_latex(text: str) -> str:
     start_match = re.match(r"\\int\s*", text)
     if not start_match:
@@ -463,6 +556,56 @@ def _integral_expression_from_latex(text: str) -> str:
     return f"integrate {integrand} d{variable}"
 
 
+def _strip_default_log_base_10(result: str, original_latex: str) -> str:
+    """Undo latex2sympy2's convention of converting a bare "\\log" (no
+    explicit subscript) to the two-argument form log(arg, 10) - i.e.
+    treating unmarked \\log as base-10.
+
+    That's a reasonable convention in some fields, but wrong for a
+    calculus solver: "log" without an explicit base is near-universally
+    intended as the natural logarithm in calculus/analysis contexts
+    (interchangeable with "ln" in most textbooks), and leaving it as
+    base-10 pollutes every antiderivative with spurious log(10) factors
+    that have nothing to do with the actual problem - e.g. this turned a
+    clean (2*ln(ln(ln(x)))-1)*ln(ln(x))**2/4 into a mess of log(10)-laden
+    terms for what should have been a natural-log-only computation.
+
+    Only applied when the original LaTeX has no explicit "\\log_" subscript
+    anywhere - if it does, some log(...,10) in the output might be a
+    genuinely-intended explicit base 10 (or base 2, etc.), and there's no
+    reliable way to tell which occurrence is which after the fact, so the
+    whole rewrite is skipped rather than risk silently changing a base the
+    user actually specified.
+    """
+    if "\\log_" in original_latex:
+        return result
+
+    def strip(text: str) -> str:
+        out = []
+        i = 0
+        while i < len(text):
+            if text[i:i + 4] == "log(":
+                depth = 1
+                j = i + 4
+                while j < len(text) and depth > 0:
+                    if text[j] == "(":
+                        depth += 1
+                    elif text[j] == ")":
+                        depth -= 1
+                    j += 1
+                inner = strip(text[i + 4:j - 1])
+                if inner.endswith(",10"):
+                    inner = inner[:-3]
+                out.append(f"log({inner})")
+                i = j
+            else:
+                out.append(text[i])
+                i += 1
+        return "".join(out)
+
+    return strip(result)
+
+
 def _latex_expression_to_plain(text: str) -> str:
     nested = _nested_x2_plus_x_expression(text)
     if nested:
@@ -472,7 +615,17 @@ def _latex_expression_to_plain(text: str) -> str:
 
         expr = latex2sympy(text)
         if expr is not None:
-            return re.sub(r"\s+", "", str(expr)).replace("**", "^")
+            result = re.sub(r"\s+", "", str(expr)).replace("**", "^")
+            # latex2sympy2 quirk: single-digit subscripts get their braces
+            # stripped correctly (x_{9} -> x_9), but multi-digit subscripts
+            # don't (x_{10} stays as the literal string "x_{10}", stray
+            # braces and all) - not valid sympy syntax, and without this
+            # fix it silently causes the whole conversion to be thrown
+            # away downstream as an "untranslated artifact", even though
+            # every other part of the expression converted correctly.
+            result = re.sub(r"_\{(\d+)\}", r"_\1", result)
+            result = _strip_default_log_base_10(result, text)
+            return result
     except Exception:
         pass
     fallback = _latex_to_plain_fallback(text)
@@ -493,6 +646,13 @@ _KNOWN_MATH_WORDS = {
     # an untranslated LaTeX leftover and gets rejected, even though "oo"
     # is precisely what the solver's own parser expects.
     "oo",
+    # Likewise, latex2sympy2 converts \sum_{n=a}^{b} f(n) to sympy's own
+    # Sum(f(n), (n, a, b)) syntax (and \prod to Product(...) the same way),
+    # which the solver's parser already understands natively (see
+    # solver.py's local_dict). Without these, any sum/product - e.g. one
+    # nested inside an integral, as in "\int (\sum ...) dx" - looks exactly
+    # like an untranslated leftover and the whole conversion is thrown away.
+    "sum", "product",
     # scaffolding words this module itself generates, e.g. "integrate x+1 dx
     # from 0 to 1" - these must never be flagged as untranslated LaTeX.
     "integrate", "from", "to",

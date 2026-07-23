@@ -253,5 +253,178 @@ class TestParserEdgeCases:
         assert_numeric_answer(r, float(-sp.pi / 2))
 
 
+# ---------------------------------------------------------------------------
+# Manually-typed raw LaTeX (as opposed to OCR'd images) reaching solve_calculus
+# ---------------------------------------------------------------------------
+
+class TestRawLatexManualEntry:
+    """normalize_expression() only understands this solver's own plain-text
+    grammar; these confirm raw LaTeX pasted directly into the "Enter a
+    calculus problem" box is delegated to the same math_ocr LaTeX converter
+    used for OCR'd images, rather than passing through untouched and failing.
+    """
+
+    def test_basic_integral_with_cdot_and_thin_space(self):
+        r = solve(r"\int e^{x}\cdot\sinh(x)\cdot\ln(\cosh(x))\,d x")
+        assert r.topic != "Unknown"
+        # This integral genuinely has no elementary closed form, but it DOES
+        # have one via the dilogarithm - see TestHardIntegralFamilies below.
+        # This test only confirms the input actually gets parsed.
+
+    def test_improper_integral_with_operatorname_and_left_right(self):
+        r = solve(r"\int_{0}^{\infty}\ln\left(\operatorname{tanh}\left(\frac{x}{2}\right)\right)\,dx")
+        assert r.topic != "Unknown"
+        assert_numeric_answer(r, float(-sp.pi**2 / 4), tol=1e-3)
+
+    def test_sum_nested_inside_integral(self):
+        # Regression test: latex2sympy2 converts \sum to sympy's own
+        # "Sum(...)" syntax, which the artifact guard was incorrectly
+        # rejecting as an untranslated LaTeX leftover (fixed by adding
+        # "sum"/"product" to _KNOWN_MATH_WORDS in math_ocr.py).
+        r = solve(r"\int_{0}^{1/2}\left(\sum_{n=2}^{\infty}x^{n}\right)\,d x")
+        assert r.topic != "Unknown"
+        assert_numeric_answer(r, float(sp.log(2) - sp.Rational(5, 8)))
+        # Must be a genuine symbolic closed form (log(2) - 5/8), not just a
+        # numeric decimal reached only via the sp.N() fallback path - see
+        # TestSumProductInsideIntegrand below for why that distinction
+        # matters and what fixes it.
+        assert "log(2)" in r.answer or "log2" in r.answer.replace(" ", "")
+
+
+class TestSumProductInsideIntegrand:
+    """Regression tests for a real gap: a Sum/Product nested inside a larger
+    integrand (as opposed to being the entire, standalone expression) never
+    took the "series" branch, and integrate() alone can't do anything with
+    a bare Sum/Product node - so the ONLY reason such cases produced any
+    answer at all was that sp.N() (numeric fallback) happens to be able to
+    push straight through an unevaluated Integral(Sum(...), ...) at once.
+    That path can never surface a symbolic closed form or step-by-step
+    derivation. _rewrite_sums_and_products() fixes this by resolving any
+    Sum/Product via .doit() before integrate() is attempted.
+    """
+
+    def test_rewrite_resolves_sum_to_closed_form(self):
+        from app.services.solver import _rewrite_for_integration, safe_sympify
+        expr, err = safe_sympify("Sum(x^n,(n,2,oo))")
+        assert expr is not None, err
+        rewritten = _rewrite_for_integration(expr)
+        # Should no longer be a bare, unresolved Sum - the geometric series
+        # closed form x**2/(1-x) (wrapped in the convergence Piecewise)
+        # must appear somewhere in the rewritten expression.
+        x = sp.symbols("x")
+        assert (x**2 / (1 - x)) in rewritten.atoms(sp.Add) or rewritten.has(sp.Piecewise)
+
+    def test_end_to_end_produces_symbolic_not_just_numeric(self):
+        r = solve(r"\int_{0}^{1/2}\left(\sum_{n=2}^{\infty}x^{n}\right)\,d x")
+        assert "log(2)" in r.answer
+        assert_numeric_answer(r, float(sp.log(2) - sp.Rational(5, 8)))
+
+
+class TestLatexArtifactGuardFalsePositives:
+    """Direct unit tests on the math_ocr conversion itself, isolating each
+    previously-mis-flagged token."""
+
+    def test_ln_produces_two_arg_log_with_capital_e_not_rejected(self):
+        from app.services.math_ocr import normalize_latex_math
+        result = normalize_latex_math(r"\int\ln(\cosh(x))\,d x")
+        assert result != ""
+        assert "log(cosh(x),E)" in result or "log(cosh(x))" in result
+
+    def test_infinity_bound_produces_oo_not_rejected(self):
+        from app.services.math_ocr import normalize_latex_math
+        result = normalize_latex_math(r"\int_{0}^{\infty}x\,d x")
+        assert result != ""
+        assert "oo" in result
+
+    def test_sum_produces_capital_sum_not_rejected(self):
+        from app.services.math_ocr import normalize_latex_math
+        result = normalize_latex_math(r"\int\left(\sum_{n=2}^{\infty}x^{n}\right)\,d x")
+        assert result != ""
+        assert "Sum(" in result
+
+
+# ---------------------------------------------------------------------------
+# Integral families sympy's default integrate() can't solve on its own, but
+# that do have closed forms - each verified independently by direct
+# differentiation (symbolic + numeric) before being added as a fast-path.
+# ---------------------------------------------------------------------------
+
+class TestHardIntegralFamilies:
+    def test_sqrt_one_plus_cosh_half_angle(self):
+        # sqrt(1+cosh(x)) = sqrt(2)*cosh(x/2) via the half-angle identity;
+        # sympy's integrate() can't find this on its own without the rewrite.
+        r = solve("integrate sqrt(1+cosh(x)) dx")
+        x = sp.symbols("x")
+        answer_expr, err = safe_sympify(r.answer.replace(" + C", "").replace("C", ""))
+        assert answer_expr is not None, err
+        integrand = sp.sqrt(1 + sp.cosh(x))
+        diff = sp.diff(answer_expr, x)
+        for xv in (-2.3, -0.5, 0.1, 1.7, 3.2):
+            assert abs(float(diff.subs(x, xv)) - float(integrand.subs(x, xv))) < 1e-6
+
+    def test_hyperbolic_secant_sqrt_family(self):
+        # 1/(cosh(x)*sqrt(cosh(2x))) = arctanh(sinh(x)/sqrt(cosh(2x))) + C,
+        # reached via u=sinh(x) then a trig substitution sympy won't chain
+        # together on its own.
+        r = solve("integrate ((1)/(cosh(x)(sqrt(cosh(2x))))) dx")
+        assert "arctanh" in r.answer or "atanh" in r.answer
+        x = sp.symbols("x")
+        answer_expr, err = safe_sympify(r.answer.replace(" + C", "").replace("C", ""))
+        assert answer_expr is not None, err
+        integrand = 1 / (sp.cosh(x) * sp.sqrt(sp.cosh(2 * x)))
+        diff = sp.diff(answer_expr, x)
+        for xv in (-1.8, -0.3, 0.4, 1.1, 2.6):
+            assert abs(float(diff.subs(x, xv)) - float(integrand.subs(x, xv))) < 1e-6
+
+    def test_exp_sinh_log_cosh_dilogarithm(self):
+        # exp(x)*sinh(x)*ln(cosh(x)) has a genuine closed form via the
+        # dilogarithm (Li_2) - not elementary, but not "unsolvable" either.
+        # sympy's integrate() returns it unevaluated since it doesn't search
+        # for polylog-based antiderivatives.
+        r = solve("integrate exp(x)*sinh(x)*log(cosh(x)) dx")
+        assert "polylog" in r.answer
+        x = sp.symbols("x")
+        answer_expr, err = safe_sympify(r.answer.replace(" + C", "").replace("C", ""))
+        assert answer_expr is not None, err
+        integrand = sp.exp(x) * sp.sinh(x) * sp.log(sp.cosh(x))
+        diff = sp.diff(answer_expr, x)
+        for xv in (-2.0, -0.6, 0.3, 1.2, 2.4):
+            got = complex(diff.subs(x, xv).evalf())
+            want = float(integrand.subs(x, xv))
+            assert abs(got - want) < 1e-6
+
+    def test_no_elementary_closed_form_reported_honestly(self):
+        # exp(sin(x)) is a classic example with no closed form at all
+        # (elementary or otherwise) - confirms the solver reports honest
+        # failure rather than an unevaluated Integral dressed up as answer.
+        r = solve("integrate exp(sin(x)) dx")
+        assert "closed-form" in r.answer.lower() or "unable" in r.answer.lower()
+        assert "Integral(" not in r.answer
+
+
+# ---------------------------------------------------------------------------
+# Symmetry substitution / periodicity reduction over infinite intervals
+# ---------------------------------------------------------------------------
+
+class TestInfiniteBoundGuards:
+    def test_symmetry_substitution_infinite_bound_no_longer_produces_nan(self):
+        # Regression test for a real bug: try_symmetry_substitution applied
+        # King's rule (x -> a+b-x) even when b=oo, where a+b-x is just oo
+        # again - substituting that produced "nan", which was then reported
+        # as if it were a verified answer.
+        r = solve(r"integrate log(tanh(x/2),E) dx from 0 to oo")
+        assert "nan" not in r.answer.lower()
+        assert_numeric_answer(r, float(-sp.pi**2 / 4), tol=1e-3)
+
+    def test_symmetry_substitution_still_works_on_finite_interval(self):
+        # Must NOT be broken by the finite-bounds guard added above - this
+        # is the exact case the King's-rule technique is meant to solve.
+        x = sp.symbols("x")
+        from app.services.pattern_matcher import try_symmetry_substitution
+        expr = x * sp.sin(x) / (1 + sp.cos(x) ** 2)
+        result = try_symmetry_substitution(expr, x, sp.Integer(0), sp.pi)
+        assert result == sp.pi**2 / 4
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

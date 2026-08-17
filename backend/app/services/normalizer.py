@@ -42,6 +42,9 @@ _UNICODE_REPLACEMENTS = {
     "÷": "/",
     "−": "-",  # unicode minus sign, distinct from hyphen
     "·": "*",
+    "\u2032": "'",  # unicode prime (y′) -> ASCII apostrophe
+    "\u2033": "''",  # double prime (y″)
+    "\u2034": "'''",  # triple prime (y‴)
 }
 
 # Function names that legitimately take a superscript power, e.g. sin²(x) ->

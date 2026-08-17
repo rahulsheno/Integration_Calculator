@@ -12,6 +12,19 @@ const examples = [
   'derivative of x^3 * e^x',
   'limit of sin(x)/x as x -> 0',
   'integrate 1/(x^2 + 1) dx',
+  "y'' + 4*y = sin(x)",
+  "ode y'' + y = 0 with y(0) = 1, y'(0) = 0",
+  'taylor exp(x) order 4',
+  'taylor log(x) at x=1 order 3',
+  'convergence of sum 1/n from n=1 to oo',
+  'convergence of sum n/2^n from n=1 to oo',
+  'laplace exp(3*x)',
+  'inverse laplace 1/(s^2 + 1)',
+  'fourier x on [-pi, pi]',
+  'gradient of x^2*y + z',
+  'divergence of x*y, y*z, z*x',
+  'curl of y*z, x*z, x*y',
+  'laplacian of x^2 + y^2 + 3*z^2',
 ];
 
 export default function SolverPage() {

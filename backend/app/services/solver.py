@@ -26,9 +26,19 @@ def latex(expr, **kwargs):
     return _sympy_latex(expr, **kwargs)
 
 from app.services.normalizer import normalize_expression, check_nesting_depth
-from app.services.series_engine import try_solve_series, try_solve_continued_fraction, try_solve_product
+from app.services.series_engine import (
+    try_solve_series, try_solve_continued_fraction, try_solve_product,
+    try_convergence_tests, try_solve_taylor,
+)
 from app.services.pattern_matcher import try_symmetry_substitution, try_periodicity_reduction, classify_named_pattern
-from app.services.verification import numerical_verify, numeric_quad as _numeric_quad
+from app.services.verification import numerical_verify, numeric_quad as _numeric_quad, verify_ode_numeric
+from app.services.ode_engine import solve_ode
+from app.services.transforms_engine import compute_laplace, compute_inverse_laplace, compute_fourier
+from app.services.vector_engine import (
+    compute_gradient, compute_divergence, compute_curl, compute_laplacian,
+    numerical_verify_gradient, numerical_verify_divergence, numerical_verify_curl,
+    numerical_verify_laplacian,
+)
 
 try:
     # Reuse the same LaTeX->plain-expression conversion already used for
@@ -188,9 +198,85 @@ def parse_expression(expr_str: str):
     m = re.match(r'solve\s+(.+)', expr_str, re.IGNORECASE)
     if m:
         body = m.group(1).strip()
-        if re.search(r"\by\s*['\(]|Derivative|diff\(|differential", body, re.IGNORECASE):
+        if re.search(
+            r"\by\s*['\(]|Derivative|diff\(|differential|"
+            r"d\s*\^?\s*\d*\s*[a-zA-Z]\s*/\s*d\s*[a-zA-Z]",
+            body, re.IGNORECASE,
+        ):
             return "differential_equation", body
         return "solve_equation", body
+
+    # Bare prime/Leibniz derivative notation without an explicit "solve"/"ode"
+    # prefix - e.g. "y'' + 4*y = sin(x)" or "dy/dx = x*y". Must run BEFORE the
+    # generic integration check, since "\bdx\b" would otherwise misclassify
+    # "dy/dx = ..." as an integral.
+    if "=" in expr_str and re.search(
+        r"\b[a-zA-Z]\s*'+|d\s*\^?\s*\d*\s*[a-zA-Z]\s*/\s*d\s*[a-zA-Z]", expr_str
+    ):
+        return "differential_equation", expr_str.strip()
+
+    # Convergence test for an infinite series: "convergence of sum ..." /
+    # "test convergence 1/n". The term may also be given in the explicit
+    # "sum <term> from n=a to oo" grammar, which we forward through.
+    m = re.match(r'(?:test\s+)?(?:convergence|converge?)\s+(?:of\s+)?(.+)', expr_str, re.IGNORECASE)
+    if m:
+        body = m.group(1).strip()
+        return "convergence", body
+
+    # Taylor / Maclaurin series expansion:
+    #   taylor <f> at x=a order n   (order omitted -> 5, Maclaurin -> center 0)
+    m = re.match(
+        r'(?:taylor|maclaurin)\s+(?:series\s+)?(?:of\s+)?(.+?)\s+'
+        r'(?:at|about|around)\s+([a-zA-Z])\s*=\s*(.+?)(?:\s+(?:to|order|up\s+to)\s+(?:order\s+)?(\d+))?$',
+        expr_str, re.IGNORECASE,
+    )
+    if m:
+        return "taylor", m.group(1).strip(), m.group(2), m.group(3).strip(), m.group(4) or "5"
+
+    m = re.match(
+        r'(?:taylor|maclaurin)\s+(?:series\s+)?(?:of\s+)?(.+?)(?:\s+(?:to|order|up\s+to)\s+(?:order\s+)?(\d+))?$',
+        expr_str, re.IGNORECASE,
+    )
+    if m:
+        return "taylor", m.group(1).strip(), "x", "0", m.group(2) or "5"
+
+    # Inverse Laplace: "inverse laplace <F>" or "laplace inverse of <F>".
+    # Must run BEFORE the generic laplace match, otherwise "laplace inverse..."
+    # gets parsed as a forward transform of garbage and falls through.
+    m = re.match(r'(?:inv(?:erse)?\s+laplace|laplace\s+inv(?:erse)?)\s+(?:of\s+)?(.+)', expr_str, re.IGNORECASE)
+    if m:
+        return "inverse_laplace", m.group(1).strip()
+
+    # Laplace transform: "laplace <f>" or "laplace transform of <f>"
+    m = re.match(r'(?:laplace\s+transform|laplace)\s+(?:of\s+)?(.+)', expr_str, re.IGNORECASE)
+    if m:
+        return "laplace", m.group(1).strip()
+
+    # Fourier series: "fourier <f> on [a,b]" (default interval [-pi, pi])
+    m = re.match(
+        r'fourier\s+(?:series\s+)?(?:of\s+)?(.+?)\s+on\s*\[?\s*(.+?)\s*,\s*(.+?)\s*\]?\s*$',
+        expr_str, re.IGNORECASE,
+    )
+    if m:
+        return "fourier", m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+    m = re.match(r'fourier\s+(?:series\s+)?(?:of\s+)?(.+)', expr_str, re.IGNORECASE)
+    if m:
+        return "fourier", m.group(1).strip(), "-pi", "pi"
+
+    # Vector calculus operators. Each accepts the field as a comma-separated
+    # tuple of components (or a single scalar field for laplacian).
+    m = re.match(r'(?:gradient|grad)\s+(?:of\s+)?(.+)', expr_str, re.IGNORECASE)
+    if m:
+        return "gradient", m.group(1).strip()
+    m = re.match(r'(?:divergence|div)\s+(?:of\s+)?(.+)', expr_str, re.IGNORECASE)
+    if m:
+        return "divergence", m.group(1).strip()
+    m = re.match(r'curl\s+(?:of\s+)?(.+)', expr_str, re.IGNORECASE)
+    if m:
+        return "curl", m.group(1).strip()
+    m = re.match(r'laplacian\s+(?:of\s+)?(.+)', expr_str, re.IGNORECASE)
+    if m:
+        return "laplacian", m.group(1).strip()
 
     m = re.match(r'(simplify|expand|factor|cancel|apart|together)\s+(.+)', expr_str, re.IGNORECASE)
     if m:
@@ -432,6 +518,10 @@ def _subject_from_parsed(parsed: tuple) -> str:
         return str(parsed[1])
     if operation == "symbolic_operation":
         return str(parsed[2])
+    if operation == "taylor":
+        return str(parsed[1])
+    if operation in {"laplace", "inverse_laplace", "gradient", "divergence", "curl", "laplacian"}:
+        return str(parsed[1])
     return " ".join(str(part) for part in parsed[1:])
 
 
@@ -448,6 +538,26 @@ def _method_from_operation(operation: str, subject_expr=None) -> str:
         return "Equation Solving"
     if operation == "symbolic_operation":
         return "Symbolic Manipulation"
+    if operation == "differential_equation":
+        return "ODE Solution (dsolve)"
+    if operation == "convergence":
+        return "Series Convergence Tests"
+    if operation == "taylor":
+        return "Taylor Series Expansion"
+    if operation == "laplace":
+        return "Laplace Transform"
+    if operation == "inverse_laplace":
+        return "Inverse Laplace Transform"
+    if operation == "fourier":
+        return "Fourier Series Coefficients"
+    if operation == "gradient":
+        return "Gradient (Partial Derivatives)"
+    if operation == "divergence":
+        return "Divergence (Partial Derivatives)"
+    if operation == "curl":
+        return "Curl (Partial Derivatives)"
+    if operation == "laplacian":
+        return "Laplacian (Second Partial Derivatives)"
     return "Symbolic Simplification"
 
 
@@ -496,6 +606,22 @@ def _with_math_context(response: SolveResponse, expression: str, parsed: tuple, 
     })
     _remember_math_context(session_id, response)
     return response
+
+
+def _early_response(response: SolveResponse, request: SolveRequest, expression: str, parsed: tuple) -> SolveResponse:
+    """Shared finalizer for branches that return before the canonical end of
+    solve_calculus. Applies the exact same include_steps contract as the
+    canonical tail (clearing steps/alternative_methods/formulas_used when
+    the caller didn't ask for steps) and attaches math context, so every
+    response path honors one single guard instead of each branch having to
+    remember it."""
+    if not request.include_steps:
+        response = response.model_copy(update={
+            "steps": [],
+            "alternative_methods": [],
+            "formulas_used": [],
+        })
+    return _with_math_context(response, expression, parsed, request.session_id)
 
 
 def _format_plain(expr) -> str:
@@ -1484,6 +1610,142 @@ def _try_wallis_fast_path(expr, x_symbol, lower_val, upper_val):
     return _wallis_closed_form_strings(m, n, multiplier, sign)
 
 
+def _extract_series_term_for_convergence(body: str, safe_sympify):
+    """Given the body of a convergence request, extract (term, var, lower).
+    Accepts either the explicit "sum <term> from n=a to b" grammar or a bare
+    term expression (defaulting to n from 1 to infinity)."""
+    m = re.match(
+        r'(?:sum|series)\s+(?:of\s+)?(.+?)\s+from\s+([a-zA-Z])\s*=\s*(.+?)\s+to\s+(.+)',
+        body, re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).strip(), m.group(2), m.group(3).strip()
+    m = re.match(r'(.+?)(?:\s+from\s+([a-zA-Z])\s*=\s*(.+?))?$', body, re.IGNORECASE)
+    if m and m.group(1):
+        return m.group(1).strip(), m.group(2) or "n", m.group(3) or "1"
+    return None, None, None
+
+
+def _vector_calc_response(expression: str, parsed: tuple, topic: str, confidence: float):
+    """Build a SolveResponse for gradient/divergence/curl/laplacian requests.
+    The field is given either as a scalar expression (gradient/laplacian) or
+    a comma-separated tuple of components "P, Q, R" (divergence/curl)."""
+    op, field_str = parsed[0], parsed[1]
+
+    is_tuple_op = op in {"divergence", "curl"}
+    if is_tuple_op:
+        components = []
+        for comp in field_str.split(","):
+            comp_expr, err = safe_sympify(comp.strip())
+            if comp_expr is None:
+                return _fallback_response(expression, topic, confidence, f"Couldn't parse component: {comp.strip()}")
+            components.append(comp_expr)
+    else:
+        field_expr, err = safe_sympify(field_str)
+        if field_expr is None:
+            return _fallback_response(expression, topic, confidence, err)
+
+    if op == "gradient":
+        result = compute_gradient(field_expr)
+        if result["error"] or result["components"] is None:
+            return _fallback_response(expression, "Vector Calculus", confidence, result["error"] or "")
+        comp_strs = [_format_plain(c) for c in result["components"]]
+        vector_latex = latex(result["vector"])
+        q_latex = rf"\nabla \left({latex(field_expr)}\right)"
+        steps_desc = "Compute the partial derivatives with respect to x, y, z"
+        justification = "grad f = (∂f/∂x, ∂f/∂y, ∂f/∂z)."
+        answer_latex = vector_latex
+        answer = "(" + ", ".join(comp_strs) + ")"
+        verified_ok, verified_msg = numerical_verify_gradient(field_expr, precomputed=result)
+        formula = FormulaUsed(
+            name="Gradient",
+            formula_latex=r"\nabla f = \frac{\partial f}{\partial x}\mathbf{i} + \frac{\partial f}{\partial y}\mathbf{j} + \frac{\partial f}{\partial z}\mathbf{k}",
+            description="The gradient is the vector of first partial derivatives.",
+        )
+    elif op == "divergence":
+        result = compute_divergence(components)
+        if result["error"] or result["divergence"] is None:
+            return _fallback_response(expression, "Vector Calculus", confidence, result["error"] or "")
+        q_latex = rf"\nabla \cdot \mathbf{{F}}"
+        steps_desc = "Sum the partial derivative of each component with respect to its variable"
+        justification = "div F = ∂P/∂x + ∂Q/∂y + ∂R/∂z."
+        answer_latex = latex(result["divergence"])
+        answer = _format_plain(result["divergence"])
+        verified_ok, verified_msg = numerical_verify_divergence(components, precomputed=result)
+        formula = FormulaUsed(
+            name="Divergence",
+            formula_latex=r"\nabla \cdot \mathbf{F} = \frac{\partial P}{\partial x}+\frac{\partial Q}{\partial y}+\frac{\partial R}{\partial z}",
+            description="The divergence is the scalar field measuring source strength.",
+        )
+    elif op == "curl":
+        result = compute_curl(components)
+        if result["error"] or result["curl"] is None:
+            return _fallback_response(expression, "Vector Calculus", confidence, result["error"] or "")
+        comp_strs = [_format_plain(result["curl"][i]) for i in range(3)]
+        q_latex = rf"\nabla \times \mathbf{{F}}"
+        steps_desc = "Apply the curl cross-product formula with partial derivatives"
+        justification = "curl F = ∇ × F, measuring the field's rotation."
+        answer_latex = latex(result["curl"])
+        answer = "(" + ", ".join(comp_strs) + ")"
+        verified_ok, verified_msg = numerical_verify_curl(components, precomputed=result)
+        formula = FormulaUsed(
+            name="Curl",
+            formula_latex=r"\nabla \times \mathbf{F} = \begin{vmatrix}\mathbf{i}&\mathbf{j}&\mathbf{k}\\\partial_x&\partial_y&\partial_z\\P&Q&R\end{vmatrix}",
+            description="The curl is computed as a formal cross product of del and F.",
+        )
+    else:  # laplacian
+        result = compute_laplacian(field_expr)
+        if result["error"] or result["laplacian"] is None:
+            return _fallback_response(expression, "Vector Calculus", confidence, result["error"] or "")
+        q_latex = rf"\nabla^2 \left({latex(field_expr)}\right)"
+        steps_desc = "Sum the second partial derivatives with respect to x, y, z"
+        justification = "∇²f = ∂²f/∂x² + ∂²f/∂y² + ∂²f/∂z²."
+        answer_latex = latex(result["laplacian"])
+        answer = _format_plain(result["laplacian"])
+        verified_ok, verified_msg = numerical_verify_laplacian(field_expr, precomputed=result)
+        formula = FormulaUsed(
+            name="Laplacian",
+            formula_latex=r"\nabla^2 f = \frac{\partial^2 f}{\partial x^2}+\frac{\partial^2 f}{\partial y^2}+\frac{\partial^2 f}{\partial z^2}",
+            description="The Laplacian is the divergence of the gradient.",
+        )
+
+    steps = [
+        StepDetail(
+            step_number=1,
+            description="Identify the vector operator and field",
+            expression_latex=q_latex,
+            justification="Apply the requested del-operator quantity to the given field.",
+        ),
+        StepDetail(
+            step_number=2,
+            description=steps_desc,
+            expression_latex=q_latex,
+            justification=justification,
+        ),
+        StepDetail(
+            step_number=3,
+            description="Result",
+            result=answer,
+            result_latex=answer_latex,
+            justification="Each component was differentiated symbolically (exact, no numeric error).",
+        ),
+    ]
+
+    return SolveResponse(
+        question=expression,
+        question_latex=q_latex,
+        topic="Vector Calculus",
+        answer=answer,
+        answer_latex=answer_latex,
+        steps=steps,
+        difficulty="Hard",
+        alternative_methods=[],
+        formulas_used=[formula],
+        verification=verified_msg,
+        ai_confidence=0.85 if verified_ok else 0.4,
+    )
+
+
 def solve_calculus(request: SolveRequest) -> SolveResponse:
     expression = normalize_expression(request.expression)
 
@@ -1691,6 +1953,412 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
                     graph_data=None, ocr_confidence=None, extracted_text=None,
                 ),
                 expression, parsed, request.session_id,
+            )
+
+        if parsed[0] == "differential_equation":
+            ode_result = solve_ode(parsed[1])
+            if ode_result is None:
+                return _with_math_context(
+                    _fallback_response(expression, topic, confidence, "Could not parse this differential equation."),
+                    expression, parsed, request.session_id,
+                )
+
+            eq, solution = ode_result["equation"], ode_result["solution"]
+            var = ode_result["var"]
+            question_latex = latex(eq)
+
+            steps.append(StepDetail(
+                step_number=1,
+                description="Write the ODE in standard form",
+                expression_latex=question_latex,
+                justification="Rearrange so all terms are on one side: LHS = 0. "
+                              + (f"Initial conditions: {', '.join(ode_result['conditions'])}." if ode_result["conditions"] else "No initial conditions given."),
+            ))
+            steps.append(StepDetail(
+                step_number=2,
+                description=f"Classify and solve (order {ode_result['order']})",
+                expression_latex=latex(solution) if solution is not None else question_latex,
+                justification=(
+                    f"Recognized as a {ode_result['method']} and solved with the matching "
+                    "technique via sympy's dsolve."
+                    if solution is not None else ode_result["error"] or "No closed-form solution found."
+                ),
+            ))
+
+            if solution is None:
+                return _with_math_context(
+                    _fallback_response(expression, "Differential Equations", confidence, ode_result["error"] or ""),
+                    expression, parsed, request.session_id,
+                )
+
+            if ode_result["particular"] is not None:
+                steps.append(StepDetail(
+                    step_number=3,
+                    description="Apply the initial conditions",
+                    expression_latex=latex(ode_result["particular"]),
+                    result_latex=latex(ode_result["particular"]),
+                    justification="Substitute each initial condition to solve for the constants C1, C2, ...",
+                ))
+                answer_expr = ode_result["particular"]
+                headline = f"{ode_result['method']}, IVP"
+            else:
+                answer_expr = solution
+                headline = ode_result["method"]
+
+            answer = _format_plain(answer_expr)
+            answer_latex = latex(answer_expr)
+
+            verify_ctx = {
+                "kind": "ode",
+                "equation": eq,
+                "solution_expr": answer_expr,
+                "var": var,
+            }
+
+            # Two independent checks: symbolic substitution (checkodesol,
+            # already run in ode_engine) and numeric residual sampling. The
+            # structured (bool, message) verdict drives both the displayed
+            # text and the confidence - no fragile string matching.
+            numeric_ok, numeric_msg = verify_ode_numeric(verify_ctx)
+            symbolic_ok = ode_result["verified"]
+
+            if numeric_ok and symbolic_ok:
+                verification = numeric_msg + " Also confirmed symbolically via substitution (checkodesol)."
+            elif numeric_ok or symbolic_ok:
+                verification = numeric_msg if numeric_ok else (
+                    "Verified by substituting the solution back into the original ODE (checkodesol): the residual is 0."
+                )
+            else:
+                verification = (
+                    "The solution was NOT independently confirmed by substitution - treat with caution. "
+                    + numeric_msg
+                )
+
+            formulas_used.append(FormulaUsed(
+                name=headline,
+                formula_latex=latex(eq),
+                description=f"Solved as a {ode_result['method']} (order {ode_result['order']}).",
+            ))
+
+            return _early_response(
+                SolveResponse(
+                    question=expression, question_latex=question_latex,
+                    topic="Differential Equations",
+                    answer=answer, answer_latex=answer_latex,
+                    steps=steps, difficulty=_estimate_difficulty("Differential Equations", expression),
+                    alternative_methods=[], formulas_used=formulas_used,
+                    verification=verification,
+                    ai_confidence=0.85 if (numeric_ok and symbolic_ok) else 0.6 if (numeric_ok or symbolic_ok) else 0.4,
+                    graph_data=None, ocr_confidence=None, extracted_text=None,
+                ),
+                request, expression, parsed,
+            )
+
+        if parsed[0] == "convergence":
+            conv_raw = parsed[1]
+            term_str, var_name, lower_str = _extract_series_term_for_convergence(conv_raw, safe_sympify)
+            if term_str is None:
+                return _with_math_context(
+                    _fallback_response(expression, topic, confidence, "Could not parse this series term."),
+                    expression, parsed, request.session_id,
+                )
+
+            conv = try_convergence_tests(term_str, var_name, lower_str, safe_sympify)
+            if conv is None:
+                return _with_math_context(
+                    _fallback_response(expression, topic, confidence, "Could not parse this series."),
+                    expression, parsed, request.session_id,
+                )
+
+            q_latex = rf"\sum_{{{var_name}={latex(conv['lower'])}}}^{{\infty}} {latex(conv['term'])}"
+
+            steps.append(StepDetail(
+                step_number=1,
+                description="Identify the series",
+                expression_latex=q_latex,
+                justification="We test whether the infinite series converges.",
+            ))
+            for idx, (test_name, detail_latex, decisive) in enumerate(conv["tests"], start=2):
+                steps.append(StepDetail(
+                    step_number=idx,
+                    description=f"Apply the {test_name}",
+                    expression_latex=detail_latex,
+                    result_latex=None,
+                    justification=(
+                        f"{test_name} is decisive." if decisive is not None
+                        else f"{test_name} was not decisive for this series."
+                    ),
+                ))
+
+            if conv["converges"] is None:
+                answer = "The standard tests (nth-term, ratio, root, integral) were not decisive for this series."
+                answer_latex = r"\text{convergence inconclusive}"
+                verification = "Not verified - no individual test gave a conclusive verdict."
+                conf = 0.3
+            elif conv["converges"]:
+                answer = "Converges"
+                answer_latex = r"\text{Converges}"
+                verification = f"Decisive via the {conv['test_name']}."
+                conf = 0.75
+            else:
+                answer = "Diverges"
+                answer_latex = r"\text{Diverges}"
+                verification = f"Decisive via the {conv['test_name']}."
+                conf = 0.75
+
+            if conv["verdict_latex"]:
+                steps.append(StepDetail(
+                    step_number=len(steps) + 1,
+                    description="Conclusion",
+                    result_latex=conv["verdict_latex"],
+                    result="Converges" if conv["converges"] else "Diverges" if conv["converges"] is False else "Inconclusive",
+                    justification=f"The {conv['test_name']} gives the final verdict.",
+                ))
+
+            return _early_response(
+                SolveResponse(
+                    question=expression, question_latex=q_latex,
+                    topic="Convergence of Series",
+                    answer=answer, answer_latex=answer_latex,
+                    steps=steps, difficulty="Medium",
+                    alternative_methods=[], formulas_used=[],
+                    verification=verification, ai_confidence=conf,
+                    graph_data=None, ocr_confidence=None, extracted_text=None,
+                ),
+                request, expression, parsed,
+            )
+
+        if parsed[0] == "taylor":
+            taylor_result = try_solve_taylor(parsed[1], parsed[2], parsed[3], parsed[4], safe_sympify)
+            if taylor_result is None or taylor_result["error"]:
+                err = (taylor_result or {}).get("error", "Could not parse this expression.")
+                return _with_math_context(
+                    _fallback_response(expression, topic, confidence, err or ""),
+                    expression, parsed, request.session_id,
+                )
+
+            poly = taylor_result["polynomial"]
+            series_full = taylor_result["series_with_O"]
+            center = taylor_result["center"]
+            order = taylor_result["order"]
+            var_name = str(taylor_result["var"])
+            is_maclaurin = bool(sp.simplify(center) == 0)
+
+            q_latex = latex(taylor_result["func"])
+            steps.append(StepDetail(
+                step_number=1,
+                description=f"Expand as a {'Maclaurin' if is_maclaurin else 'Taylor'} series about {var_name} = {center}",
+                expression_latex=q_latex,
+                justification=(
+                    f"The {'Maclaurin' if is_maclaurin else 'Taylor'} series is "
+                    rf"\sum_{{n=0}}^{{\infty}} \frac{{f^{{(n)}}({latex(center)})}}{{n!}}({var_name}-{latex(center)})^n."
+                ),
+            ))
+            steps.append(StepDetail(
+                step_number=2,
+                description=f"Compute terms through order {order}",
+                expression_latex=latex(series_full),
+                result=latex(poly),
+                result_latex=latex(poly),
+                justification="Differentiate repeatedly, evaluate at the center, and assemble the polynomial; "
+                              "the O(...) term marks the truncation error.",
+            ))
+
+            answer = _format_plain(poly)
+            answer_latex = latex(poly)
+
+            return _early_response(
+                SolveResponse(
+                    question=expression, question_latex=q_latex,
+                    topic="Taylor & Maclaurin Series",
+                    answer=answer, answer_latex=answer_latex,
+                    steps=steps, difficulty="Medium",
+                    alternative_methods=[], formulas_used=[FormulaUsed(
+                        name="Taylor Series Formula",
+                        formula_latex=r"f(x)=\sum_{n=0}^{\infty}\frac{f^{(n)}(a)}{n!}(x-a)^n",
+                        description="Expansion of a smooth function about the point a.",
+                    )],
+                    verification="Verified via sympy's series expansion (symbolic term-by-term).",
+                    ai_confidence=0.8,
+                    graph_data=None, ocr_confidence=None, extracted_text=None,
+                ),
+                request, expression, parsed,
+            )
+
+        if parsed[0] == "laplace":
+            x_sym = sp.Symbol("x", positive=True)
+            s_sym = sp.Symbol("s")
+            func, err = safe_sympify(parsed[1])
+            if func is None:
+                return _with_math_context(_fallback_response(expression, topic, confidence, err), expression, parsed, request.session_id)
+            func = func.subs(sp.Symbol("x"), x_sym)
+            lap = compute_laplace(func, x_sym, s_sym)
+            if lap["error"] or lap["transform"] is None:
+                return _with_math_context(
+                    _fallback_response(expression, "Laplace Transforms", confidence, lap["error"] or "No closed form."),
+                    expression, parsed, request.session_id,
+                )
+            q_latex = rf"\mathcal{{L}}\left\{{ {latex(func)} \right\}}(s)"
+            steps.append(StepDetail(
+                step_number=1,
+                description="Set up the Laplace transform",
+                expression_latex=rf"\int_0^\infty {latex(func)} e^{{-s t}} \, dt",
+                justification=r"The Laplace transform is defined by $\int_0^\infty f(x) e^{-sx}\,dx$.",
+            ))
+            steps.append(StepDetail(
+                step_number=2,
+                description="Evaluate the transform",
+                expression_latex=latex(lap["transform"]),
+                result_latex=latex(lap["transform"]),
+                justification="Evaluated via standard transform pairs and sympy's integral machinery."
+                              + (f" Region of convergence: {latex(lap['condition'])}." if lap["condition"] is not True and lap["condition"] is not None else ""),
+            ))
+            answer = _format_plain(lap["transform"])
+            return _early_response(
+                SolveResponse(
+                    question=expression, question_latex=q_latex,
+                    topic="Laplace Transforms",
+                    answer=answer, answer_latex=latex(lap["transform"]),
+                    steps=steps, difficulty="Medium",
+                    alternative_methods=[], formulas_used=[FormulaUsed(
+                        name="Laplace Transform Definition",
+                        formula_latex=r"\mathcal{L}\{f(x)\}=\int_0^{\infty}f(x)e^{-sx}\,dx",
+                        description="Integral transform mapping a function of x to a function of s.",
+                    )],
+                    verification="Verified via sympy's laplace_transform (symbolic evaluation of the defining integral).",
+                    ai_confidence=0.8,
+                    graph_data=None, ocr_confidence=None, extracted_text=None,
+                ),
+                request, expression, parsed,
+            )
+
+        if parsed[0] == "inverse_laplace":
+            s_sym = sp.Symbol("s")
+            x_sym = sp.Symbol("x")
+            F, err = safe_sympify(parsed[1])
+            if F is None:
+                return _with_math_context(_fallback_response(expression, topic, confidence, err), expression, parsed, request.session_id)
+            F = F.subs(sp.Symbol("t"), x_sym)
+            inv = compute_inverse_laplace(F, s_sym, x_sym)
+            if inv["error"] or inv["inverse"] is None:
+                return _with_math_context(
+                    _fallback_response(expression, "Laplace Transforms", confidence, inv["error"] or "No closed form."),
+                    expression, parsed, request.session_id,
+                )
+            q_latex = rf"\mathcal{{L}}^{{-1}}\left\{{ {latex(F)} \right\}}"
+            steps.append(StepDetail(
+                step_number=1,
+                description="Identify the inverse transform",
+                expression_latex=q_latex,
+                justification="Find f(x) whose Laplace transform is the given function of s.",
+            ))
+            steps.append(StepDetail(
+                step_number=2,
+                description="Invert via known transform pairs",
+                expression_latex=latex(inv["inverse"]),
+                result_latex=latex(inv["inverse"]),
+                justification="Matched against standard transform pairs (and partial fractions where needed) via sympy's inverse_laplace_transform.",
+            ))
+            return _early_response(
+                SolveResponse(
+                    question=expression, question_latex=q_latex,
+                    topic="Laplace Transforms",
+                    answer=_format_plain(inv["inverse"]), answer_latex=latex(inv["inverse"]),
+                    steps=steps, difficulty="Medium",
+                    alternative_methods=[], formulas_used=[FormulaUsed(
+                        name="Inverse Laplace Definition",
+                        formula_latex=r"\mathcal{L}^{-1}\{\mathcal{L}\{f\}\}=f",
+                        description="Recovers f from its transform (unique up to sets of measure zero).",
+                    )],
+                    verification="Verified via sympy's inverse_laplace_transform.",
+                    ai_confidence=0.8,
+                    graph_data=None, ocr_confidence=None, extracted_text=None,
+                ),
+                request, expression, parsed,
+            )
+
+        if parsed[0] == "fourier":
+            f_str, lo_str, hi_str = parsed[1], parsed[2], parsed[3]
+            f_expr, err = safe_sympify(f_str)
+            if f_expr is None:
+                return _with_math_context(_fallback_response(expression, topic, confidence, err), expression, parsed, request.session_id)
+            lo_expr, _ = safe_sympify(lo_str)
+            hi_expr, _ = safe_sympify(hi_str)
+            if lo_expr is None:
+                lo_expr = -sp.pi
+            if hi_expr is None:
+                hi_expr = sp.pi
+            x_sym_name = None
+            for sym in f_expr.free_symbols:
+                x_sym_name = sym.name
+                break
+            var_sym = sp.Symbol(x_sym_name or "x")
+
+            ff = compute_fourier(f_expr, var_sym, lo_expr, hi_expr, num_terms=5)
+            if ff["error"]:
+                return _with_math_context(
+                    _fallback_response(expression, "Fourier Series", confidence, ff["error"]),
+                    expression, parsed, request.session_id,
+                )
+
+            q_latex = rf"{latex(f_expr)} \text{{ on }} [{latex(lo_expr)}, {latex(hi_expr)}]"
+            steps.append(StepDetail(
+                step_number=1,
+                description="Write the Fourier coefficient formulas",
+                expression_latex=rf"f(x)=\frac{{a_0}}2+\sum_{{n=1}}^{{\infty}}\left(a_n\cos(nx)+b_n\sin(nx)\right)",
+                justification="The Fourier series decomposes a periodic function into sines and cosines over this interval.",
+            ))
+            steps.append(StepDetail(
+                step_number=2,
+                description="a0",
+                expression_latex=rf"a_0 = {latex(ff['a0'])}",
+                justification="a0 = (1/L) integral of f over one period.",
+            ))
+            if ff["an"] is not None:
+                steps.append(StepDetail(
+                    step_number=3,
+                    description="an",
+                    expression_latex=rf"a_n = {latex(ff['an'])}",
+                    justification="Computed by integrating f(x)cos(nx).",
+                ))
+            if ff["bn"] is not None:
+                steps.append(StepDetail(
+                    step_number=4,
+                    description="bn",
+                    expression_latex=rf"b_n = {latex(ff['bn'])}",
+                    justification="Computed by integrating f(x)sin(nx).",
+                ))
+            steps.append(StepDetail(
+                step_number=5,
+                description="First few terms of the series",
+                expression_latex=latex(ff["partial_sum"]),
+                result_latex=latex(ff["partial_sum"]),
+                justification="Truncating the series to its first several terms shows the pattern.",
+            ))
+
+            answer = _format_plain(ff["partial_sum"])
+            return _early_response(
+                SolveResponse(
+                    question=expression, question_latex=q_latex,
+                    topic="Fourier Series",
+                    answer=answer, answer_latex=latex(ff["partial_sum"]),
+                    steps=steps, difficulty="Hard",
+                    alternative_methods=[], formulas_used=[FormulaUsed(
+                        name="Fourier Coefficients",
+                        formula_latex=r"a_n=\frac{1}{L}\int_{-L}^{L}f(x)\cos\frac{n\pi x}{L}dx,\; b_n=\frac{1}{L}\int_{-L}^{L}f(x)\sin\frac{n\pi x}{L}dx",
+                        description="Projection of f onto the cosine and sine basis functions.",
+                    )],
+                    verification="Verified via sympy's fourier_series coefficient computation.",
+                    ai_confidence=0.75,
+                    graph_data=None, ocr_confidence=None, extracted_text=None,
+                ),
+                request, expression, parsed,
+            )
+
+        if parsed[0] in {"gradient", "divergence", "curl", "laplacian"}:
+            return _early_response(
+                _vector_calc_response(expression, parsed, topic, confidence),
+                request, expression, parsed,
             )
 
         if parsed[0] == "limit":

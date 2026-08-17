@@ -26,6 +26,8 @@ series given only as a handful of numeric terms with no explicit formula
 import re
 import sympy as sp
 
+from app.services.compute_utils import run_with_timeout
+
 
 def try_solve_product(term_str: str, var_name: str, lower_str: str, upper_str: str, safe_sympify):
     """Attempt to evaluate an infinite (or finite) product prod(term, (var, lower, upper)).
@@ -148,6 +150,201 @@ def _classify_series_pattern(term, var) -> str | None:
         return "p-Series"
 
     return None
+
+
+def try_convergence_tests(term_str: str, var_name: str, lower_str: str, safe_sympify):
+    """Apply a battery of standard convergence tests to the series
+    sum(term, (var, lower, oo)) and return the first decisive verdict, plus
+    the supporting computations so the caller can show them as steps.
+
+    Returns a dict on success:
+
+        {
+          "term": sympy term, "var": symbol, "lower": expr,
+          "converges": bool|None,       # None = no decisive test
+          "test_name": str|None,        # the decisive test's name
+          "verdict_latex": str,         # e.g. "L = 1/2 < 1 \\Rightarrow converges"
+          "tests": [ (name, detail_latex, decisive_bool|None) ],
+          "error": str|None,
+        }
+
+    None is returned only when the term can't be parsed at all. A parseable
+    series that no test conclusively judges comes back with converges=None
+    and the tests that were tried listed out, so the caller can report
+    honestly rather than guess.
+    """
+    term, err = safe_sympify(term_str)
+    if term is None:
+        return None
+
+    name_matches = [s for s in term.free_symbols if s.name == var_name]
+    var = name_matches[0] if name_matches else sp.Symbol(var_name)
+
+    try:
+        lower, _ = safe_sympify(lower_str)
+    except Exception:
+        lower = None
+    if lower is None:
+        lower = sp.Integer(1)
+
+    tests: list[tuple[str, str, "bool | None"]] = []
+    decisive_name = None
+    converges = None
+    verdict_latex = ""
+
+    # 1) n-th-term (divergence) test: if a_n !-> 0 the series diverges.
+    try:
+        nth = run_with_timeout(sp.limit, term, var, sp.oo, seconds=15)
+        nth_s = sp.simplify(nth)
+        is_zero = sp.simplify(nth_s) == 0
+        tests.append((
+            "Nth-Term Test",
+            rf"\lim_{{n \to \infty}} a_n = {sp.latex(nth_s)}",
+            (False if not is_zero else None),
+        ))
+        if not is_zero:
+            decisive_name, converges = "Nth-Term Test", False
+            verdict_latex = (
+                rf"\lim_{{n \to \infty}} a_n = {sp.latex(nth_s)} \neq 0, "
+                r"\text{so the series diverges.}"
+            )
+    except Exception:
+        pass
+
+    if converges is None:
+        # 2) Ratio test: L = lim |a_{n+1} / a_n|; L<1 conv, L>1 div, L=1 inconclusive.
+        try:
+            a_np1 = term.subs(var, var + 1)
+            ratio = sp.simplify(sp.Abs(a_np1 / term))
+            L = run_with_timeout(sp.limit, ratio, var, sp.oo, seconds=15)
+            L_s = sp.simplify(L)
+            l_numeric = complex(sp.N(L_s)) if L_s.is_number else None
+            if l_numeric is not None:
+                mag = l_numeric.real
+                if mag < 1:
+                    decisive_name, converges = "Ratio Test", True
+                    verdict_latex = rf"L = \lim_{{n\to\infty}} \left|\frac{{a_{{n+1}}}}{{a_n}}\right| = {sp.latex(L_s)} < 1 \Rightarrow \text{{converges}}"
+                elif mag > 1:
+                    decisive_name, converges = "Ratio Test", False
+                    verdict_latex = rf"L = {sp.latex(L_s)} > 1 \Rightarrow \text{{diverges}}"
+                else:
+                    verdict_latex = rf"L = {sp.latex(L_s)} = 1 \Rightarrow \text{{inconclusive}}"
+            tests.append(("Ratio Test", rf"L = {sp.latex(L_s)}", converges))
+        except Exception:
+            pass
+
+    if converges is None:
+        # 3) Root test: L = lim |a_n|^(1/n).
+        try:
+            L_root = run_with_timeout(sp.limit, sp.Abs(term) ** (1 / var), var, sp.oo, seconds=15)
+            L_root_s = sp.simplify(L_root)
+            l_numeric = complex(sp.N(L_root_s)) if L_root_s.is_number else None
+            if l_numeric is not None:
+                mag = l_numeric.real
+                if mag < 1:
+                    decisive_name, converges = "Root Test", True
+                    verdict_latex = rf"L = \lim_{{n\to\infty}} \sqrt[n]{{|a_n|}} = {sp.latex(L_root_s)} < 1 \Rightarrow \text{{converges}}"
+                elif mag > 1:
+                    decisive_name, converges = "Root Test", False
+                    verdict_latex = rf"L = {sp.latex(L_root_s)} > 1 \Rightarrow \text{{diverges}}"
+            tests.append(("Root Test", rf"L = {sp.latex(L_root_s)}", converges))
+        except Exception:
+            pass
+
+    if converges is None:
+        # 4) Integral test for positive, decreasing terms (catches p-series family).
+        try:
+            integ = run_with_timeout(sp.integrate, term, (var, lower, sp.oo), seconds=20)
+            integ_s = sp.simplify(integ)
+            if integ_s.has(sp.Integral):
+                raise ValueError("unevaluated")
+            lower_latex = sp.latex(lower)
+            term_latex = sp.latex(term)
+            if integ_s.is_finite:
+                decisive_name, converges = "Integral Test", True
+                verdict_latex = (
+                    rf"\int_{{{lower_latex}}}^{{\infty}} {term_latex} \, d{var_name} "
+                    rf"= {sp.latex(integ_s)} \text{{ is finite}} \Rightarrow \text{{converges}}"
+                )
+            elif integ_s in (sp.oo, sp.zoo, -sp.oo):
+                decisive_name, converges = "Integral Test", False
+                verdict_latex = (
+                    rf"\int_{{{lower_latex}}}^{{\infty}} {term_latex} \, d{var_name} "
+                    r"\text{ diverges} \Rightarrow \text{the series diverges}"
+                )
+            tests.append(("Integral Test", rf"\int = {sp.latex(integ_s)}", converges))
+        except Exception:
+            pass
+
+    return {
+        "term": term,
+        "var": var,
+        "lower": lower,
+        "converges": converges,
+        "test_name": decisive_name,
+        "verdict_latex": verdict_latex,
+        "tests": tests,
+        "error": None if converges is not None else (
+            "No individual test was decisive - the series may converge conditionally "
+            "or require a comparison test with a suitable reference series."
+        ),
+    }
+
+
+def try_solve_taylor(func_str: str, var_name: str, center_str: str, order_str: str, safe_sympify):
+    """Compute the Taylor (or Maclaurin, if center is 0) series of func about
+    `center` through `order`. Returns a dict:
+
+        {
+          "func": expr, "var": symbol, "center": expr, "order": int,
+          "series_with_O": series incl. the big-O term,
+          "polynomial": expr (series with the O() term dropped),
+          "error": str|None,
+        }
+
+    None only when parsing fails outright.
+    """
+    func, err = safe_sympify(func_str)
+    if func is None:
+        return None
+
+    center, err = safe_sympify(center_str)
+    if center is None:
+        center = sp.Integer(0)
+
+    try:
+        order_val = int(sp.N(safe_sympify(order_str)[0]))
+    except Exception:
+        order_val = 5
+    order_val = max(1, min(order_val, 20))
+
+    name_matches = [s for s in func.free_symbols if s.name == var_name]
+    var = name_matches[0] if name_matches else sp.Symbol(var_name)
+
+    try:
+        series_exp = run_with_timeout(sp.series, func, var, center, order_val + 1, seconds=20)
+    except Exception:
+        return {
+            "func": func, "var": var, "center": center, "order": order_val,
+            "series_with_O": None, "polynomial": None,
+            "error": "sympy couldn't expand this function as a Taylor series about that point.",
+        }
+
+    polynomial = series_exp.removeO()
+    try:
+        polynomial = sp.simplify(polynomial)
+    except Exception:
+        pass
+
+    return {
+        "func": func,
+        "var": var,
+        "center": center,
+        "order": order_val,
+        "series_with_O": series_exp,
+        "polynomial": polynomial,
+        "error": None,
+    }
 
 
 _CF_PLACEHOLDER = "W"  # single letter, and avoids sympy's reserved names (Q, E, I, S, N, O)

@@ -106,6 +106,62 @@ def numeric_quad(expr, var, lower_val, upper_val):
     return mp.quad(f, points)
 
 
+def verify_ode_numeric(verify_ctx) -> tuple[bool, str]:
+    """Numeric residual check for an ODE solution. Substitutes the candidate
+    solution y(x) into the ODE's standard form (LHS = 0) and samples the
+    residual at several points. A true solution leaves residual ~0 wherever
+    the functions are defined.
+
+    Returns a structured (ok: bool, message: str) pair so callers can make
+    decisions on the verdict instead of sniffing message text. This is an
+    independent numeric complement to the symbolic checkodesol test the
+    ode_engine already runs.
+
+    An arbitrary general solution still contains free constants C1, C2, ...
+    The ODE must hold for ANY choice of them, so numeric values are pinned
+    for the residual check (distinct, non-round numbers avoid masking bugs).
+    """
+    equation = verify_ctx["equation"]
+    sol = verify_ctx["solution_expr"]  # Eq(y(x), rhs)
+    var = verify_ctx["var"]            # x
+
+    try:
+        residual = (equation.lhs - equation.rhs).subs(sol.lhs, sol.rhs).doit()
+        try:
+            residual = sp.simplify(residual)
+        except Exception:
+            pass
+
+        free = sorted(residual.free_symbols - {var}, key=lambda sym: sym.name)
+        residual = residual.subs({
+            sym: 1.3 + 0.1 * i for i, sym in enumerate(free)
+        })
+
+        f_res = sp.lambdify(var, residual, modules=["mpmath"])
+    except Exception:
+        return False, "Result computed symbolically; numeric ODE verification was not possible."
+
+    sample_points = [-1.5, -0.6, 0.3, 0.7, 1.3, 2.1]
+    checked, mismatches = 0, 0
+    for p in sample_points:
+        try:
+            val = complex(f_res(p))
+        except Exception:
+            continue
+        checked += 1
+        if abs(val) > 1e-4:
+            mismatches += 1
+
+    if checked == 0:
+        return False, "Result computed symbolically; numeric ODE verification unavailable for this domain."
+    if mismatches == 0:
+        return True, f"Verified numerically: the ODE residual is ~0 at {checked} sample points."
+    return False, (
+        f"⚠ Could not verify this result: substituting the solution into the ODE left a nonzero "
+        f"residual at {mismatches}/{checked} sample points. Treat this answer with caution."
+    )
+
+
 def numerical_verify(verify_ctx, topic: str) -> str:
     """Numerically check the computed result against the original
     expression, and report honestly - including when the check fails or
@@ -199,6 +255,10 @@ def numerical_verify(verify_ctx, topic: str) -> str:
                 f"⚠ Could not verify this result: it disagreed with a numeric finite-difference check at "
                 f"{mismatches}/{checked} sample points. Treat this answer with caution."
             )
+
+        if kind == "ode":
+            ok, message = verify_ode_numeric(verify_ctx)
+            return message
 
     except Exception:
         # Verification machinery itself failed (e.g. couldn't lambdify some

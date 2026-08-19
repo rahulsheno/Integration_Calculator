@@ -187,8 +187,11 @@ def _rewrite_sum_product_symbols(text: str) -> str:
         return f"{kind} {term.strip()} from {var}={lower.strip()} to {upper.strip()}"
 
     pattern = r"(Σ|Π)\(\s*([a-zA-Z])\s*=\s*(.+?)\s+to\s+(.+?)\)\s*(.+)"
-    return re.sub(pattern, repl, text)
+    text = re.sub(pattern, repl, text)
 
+    # FIXED: Also handle subscript/superscript bounds (Σ_{n=2}^{oo} x^n)
+    pattern2 = r"(Σ|Π)_\{?\s*([a-zA-Z])\s*=\s*([^}^ ]+)\s*\}?\s*\^\{?\s*([^}^ ]+)\s*\}?\s*(.+)"
+    return re.sub(pattern2, repl, text)
 
 def normalize_expression(text: str) -> str:
     """Run the full normalization pipeline on raw input text. Idempotent -

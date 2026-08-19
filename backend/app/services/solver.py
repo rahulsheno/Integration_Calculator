@@ -384,6 +384,53 @@ _POWER_NOTATION_FUNCS = sorted(
 _POWER_NOTATION_FUNC_RE = re.compile(r"(" + "|".join(_POWER_NOTATION_FUNCS) + r")\^")
 
 
+def _find_integrand_series(integrand: str):
+    """If `integrand` contains a plain-text infinite/finite series
+    "sum <term> from <var>=<lower> to <upper>" (optionally prefixed by
+    "series of" - and possibly preceded by other tokens such as the
+    "integrate" keyword), return a 7-tuple
+    (term, var, lower, upper, start, end, upper_str) so callers can
+    rewrite just that span in place; otherwise None. The upper bound is
+    matched non-greedily and stops at the next "dx"/"from" boundary so the
+    series' *own* summation range ("from n=2 to infinity") is never confused
+    with an enclosing integral's integration bounds ("from 0 to 1/2")."""
+    m = re.search(
+        r'(?:sum|series)\s+(?:of\s+)?(.+?)\s+from\s+([a-zA-Z])\s*=\s*(.+?)\s+to\s+(.+?)(?=\s+d[a-zA-Z]\b|\s+from\b|\s*$)',
+        integrand, re.IGNORECASE,
+    )
+    if not m:
+        return None
+    return (
+        m.group(1).strip(),
+        m.group(2),
+        m.group(3).strip(),
+        m.group(4).strip(),
+        m.start(),
+        m.end(),
+        m.group(4).strip(),
+    )
+
+
+def _rewrite_integrand_series(integrand: str) -> str:
+    """Rewrite a plain-text series nested inside an integrand (or anywhere
+    in a to-be-parsed expression string) into sympy's Sum(...) call syntax,
+    e.g. "sum x^n from n=2 to infinity" -> "Sum(x^n,(n,2,oo))", replacing
+    only the matched span in place so surrounding tokens (like the leading
+    "integrate" keyword or the trailing "dx from 0 to 1/2") are preserved.
+    safe_sympify understands Sum(...) natively (it is in its local_dict), so
+    the integrand becomes a real sp.Sum object that the interchange-of-
+    summation-and-integration machinery can integrate term-by-term.
+    Non-series inputs are returned untouched."""
+    found = _find_integrand_series(integrand)
+    if found is None:
+        return integrand
+    term, var, lower, upper, start, end, _upper_str = found
+    if upper.lower() in ("oo", "infinity", "inf", "∞"):
+        upper = "oo"
+    replacement = f"Sum(({term}),({var},{lower},{upper}))"
+    return integrand[:start] + replacement + integrand[end:]
+
+
 def _consume_balanced_parens(text: str, pos: int) -> tuple[str | None, int]:
     """Consume a balanced (...) group starting at `pos`. Returns (inner
     text, index just past the closing paren), or (None, pos) if `pos`

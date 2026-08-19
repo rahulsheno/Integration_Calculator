@@ -1806,6 +1806,34 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
         if latex_expression:
             expression = latex_expression
 
+    from app.services.series_integral_engine import try_series_integral
+    series_hit = try_series_integral(expression)
+    if series_hit:
+        steps = [
+            StepDetail(step_number=i, description=d, expression_latex=e,
+                       justification=j, result_latex=r)
+            for i, (d, e, j, r) in enumerate(series_hit["steps"], 1)
+        ]
+        return _with_math_context(SolveResponse(
+            question=expression,
+            question_latex=series_hit["question_latex"],
+            topic="Series Integrals",
+            answer=series_hit["answer"],
+            answer_latex=series_hit["answer_latex"],
+            steps=steps,
+            difficulty="Medium",
+            formulas_used=[
+                FormulaUsed(name="Geometric Series",
+                            formula_latex=r"\sum_{n=k}^{\infty} x^n = \frac{x^k}{1-x},\ |x|<1",
+                            description="Closed form of the geometric series."),
+                FormulaUsed(name="Interchange of Summation and Integration",
+                            formula_latex=r"\int_a^b \sum_n f_n = \sum_n \int_a^b f_n",
+                            description="Term-by-term integration of a uniformly convergent series."),
+            ],
+            verification=series_hit["verification"],
+            ai_confidence=0.95,
+        ), expression, ("series_integral",), request.session_id)
+
     depth_error = check_nesting_depth(expression)
     if depth_error:
         return _fallback_response(expression, "Unsupported", 0.0, depth_error)

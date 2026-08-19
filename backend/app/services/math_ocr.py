@@ -413,12 +413,15 @@ def _clean_latex_text(latex_text: str) -> str:
 
 
 def _consume_bound(text: str, pos: int) -> tuple[str | None, int]:
-    """Consume one integral bound starting at `pos`: either a balanced
-    {...} group (which may itself contain nested braces, e.g.
-    \\frac{\\pi}{2}), or a single bare token like "0" or "\\pi"."""
+    """Consume one integral bound. FIXED: also consumes bare fractional
+    bounds (1/2) and \\frac{a}{b} without braces, which previously
+    truncated to just the numerator and corrupted the whole parse."""
     if pos < len(text) and text[pos] == "{":
         return _consume_balanced(text, pos, "{", "}")
-    tok_match = re.match(r"\\?[a-zA-Z0-9]+", text[pos:])
+    frac = re.match(r"\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}", text[pos:])
+    if frac:
+        return text[pos:pos + frac.end()], pos + frac.end()
+    tok_match = re.match(r"-?[a-zA-Z0-9]+(?:\.[0-9]+)?(?:/[a-zA-Z0-9]+(?:\.[0-9]+)?)?", text[pos:])
     if not tok_match:
         return None, pos
     return tok_match.group(0), pos + tok_match.end()
@@ -1110,34 +1113,31 @@ def _ollama_available() -> bool:
 
 
 def _vision_llm_expression(image: Image.Image) -> tuple[str, str]:
-    """Returns (expression, raw_model_text). Empty expression if Ollama/the
-    model isn't available, the request fails, or the model's output can't
-    be safely parsed as one of our two supported forms."""
+    """Last-resort image reader. FIXED: demand strict LaTeX (not free
+    English) so nested operators (\\sum with bounds) and fractional
+    integral limits survive, then validate via normalize_latex_math."""
     if not _ollama_available():
         return "", ""
-
-    buffer = io.BytesIO()
-    image.convert("RGB").save(buffer, format="PNG")
-    image_b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
-
+    buf = io.BytesIO()
+    image.convert("RGB").save(buf, format="PNG")
+    payload = {
+        "model": _OLLAMA_VISION_MODEL,
+        "prompt": (
+            "Transcribe the mathematical formula in this image as ONE line of LaTeX. "
+            "Keep \\int with its lower and upper limits, \\sum with its subscript and "
+            "superscript bounds, \\frac{...}{...} and \\infty exactly as printed. "
+            "Reply with ONLY the LaTeX - no words, no $ signs, no markdown."
+        ),
+        "images": [base64.b64encode(buf.getvalue()).decode()],
+        "stream": False,
+    }
     try:
-        response = httpx.post(
-            f"{_OLLAMA_URL}/api/generate",
-            json={
-                "model": _OLLAMA_VISION_MODEL,
-                "prompt": _VISION_LLM_PROMPT,
-                "images": [image_b64],
-                "stream": False,
-                "options": {"temperature": 0},
-            },
-            timeout=120.0,
-        )
-        response.raise_for_status()
-        raw_text = response.json().get("response", "").strip()
+        resp = httpx.post(f"{_OLLAMA_URL}/api/generate", json=payload, timeout=120.0)
+        resp.raise_for_status()
+        raw = (resp.json().get("response") or "").strip()
     except Exception:
         return "", ""
-
-    return _parse_vision_llm_output(raw_text), raw_text
+    return normalize_latex_math(raw), raw
 
 
 def _parse_vision_llm_output(raw_text: str) -> str:

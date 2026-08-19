@@ -173,21 +173,18 @@ def check_nesting_depth(text: str, max_depth: int = 60) -> str | None:
 
 
 def _rewrite_sum_product_symbols(text: str) -> str:
-    """Rewrite unicode Σ (sum) and Π (product) with subscript/superscript
-    bounds into the plain-text "sum ... from n=a to b" form the parser
-    already understands, e.g. "Σ(n=1 to oo) 1/n^2" -> "sum 1/n^2 from n=1 to oo".
-    Only handles the common "Σ(var=lower to upper) term" and bare "Σ term"
-    (bounds supplied separately elsewhere) shapes - arbitrary placement of
-    unicode bounds (true subscript/superscript glyphs from OCR) is handled
-    upstream by math_ocr.py's LaTeX conversion instead.
-    """
     def repl(match: "re.Match[str]") -> str:
         kind = "sum" if match.group(1) == "Σ" else "product"
-        var, lower, upper, term = match.group(2), match.group(3), match.group(4), match.group(5)
+        var, lower, upper, term = (match.group(2), match.group(3),
+                                   match.group(4), match.group(5))
         return f"{kind} {term.strip()} from {var}={lower.strip()} to {upper.strip()}"
 
     pattern = r"(Σ|Π)\(\s*([a-zA-Z])\s*=\s*(.+?)\s+to\s+(.+?)\)\s*(.+)"
-    return re.sub(pattern, repl, text)
+    text = re.sub(pattern, repl, text)
+
+    # NEW: subscript/superscript bounds, e.g. "Σ_{n=2}^{oo} x^n"
+    pattern2 = r"(Σ|Π)_\{?\s*([a-zA-Z])\s*=\s*([^}^ ]+)\s*\}?\s*\^\{?\s*([^}^ ]+)\s*\}?\s*(.+)"
+    return re.sub(pattern2, repl, text)
 
 
 def normalize_expression(text: str) -> str:

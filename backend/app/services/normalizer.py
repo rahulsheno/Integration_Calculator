@@ -193,6 +193,7 @@ def _rewrite_sum_product_symbols(text: str) -> str:
     pattern2 = r"(Σ|Π)_\{?\s*([a-zA-Z])\s*=\s*([^}^ ]+)\s*\}?\s*\^\{?\s*([^}^ ]+)\s*\}?\s*(.+)"
     return re.sub(pattern2, repl, text)
 
+
 def normalize_expression(text: str) -> str:
     """Run the full normalization pipeline on raw input text. Idempotent -
     calling this twice on already-normalized text is a no-op.

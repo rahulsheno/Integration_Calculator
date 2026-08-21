@@ -1,0 +1,52 @@
+- generic [ref=e3]:
+  - complementary [ref=e4]:
+    - generic [ref=e5]:
+      - link "∫ Calculus Solver & Checker" [ref=e7] [cursor=pointer]:
+        - /url: /
+        - generic [ref=e8]: ∫
+        - generic [ref=e10]:
+          - generic [ref=e11]: Calculus Solver
+          - generic [ref=e12]: "& Checker"
+      - navigation [ref=e13]:
+        - link "Solver" [ref=e14] [cursor=pointer]:
+          - /url: /solve
+        - link "Library" [ref=e17] [cursor=pointer]:
+          - /url: /library
+        - link "Collections" [ref=e20] [cursor=pointer]:
+          - /url: /collections
+      - generic [ref=e23]:
+        - button "Dark Mode" [ref=e24] [cursor=pointer]
+        - generic [ref=e27]: Press Ctrl+K to search
+  - main [ref=e29]:
+    - generic [ref=e30]:
+      - generic [ref=e31]:
+        - button "Solve" [active] [ref=e32] [cursor=pointer]
+        - button "Verify Solution" [ref=e33] [cursor=pointer]
+      - generic [ref=e34]:
+        - generic [ref=e35]: Enter a calculus problem
+        - textbox "e.g., integrate x^2 * sin(x) dx, solve x^2 - 4 = 0, simplify sin(x)^2 + cos(x)^2..." [ref=e36]: "\\sum_{n=1}^{4}\\int_{0}^{1}{n x^{n-1}\\,d x}"
+        - generic [ref=e37]:
+          - generic [ref=e38]: Or upload an image of the problem
+          - button "Click to upload image (handwritten or printed)" [ref=e39] [cursor=pointer]
+        - button "Solve" [ref=e45] [cursor=pointer]
+        - generic [ref=e48]:
+          - generic [ref=e49]: "Try:"
+          - button "integrate x^2 * sin(x) dx" [ref=e50] [cursor=pointer]
+          - button "solve x^2 - 4 = 0" [ref=e51] [cursor=pointer]
+          - button "simplify sin(x)^2 + cos(x)^2" [ref=e52] [cursor=pointer]
+          - button "derivative of x^3 * e^x" [ref=e53] [cursor=pointer]
+          - button "limit of sin(x)/x as x -> 0" [ref=e54] [cursor=pointer]
+          - button "integrate 1/(x^2 + 1) dx" [ref=e55] [cursor=pointer]
+          - button "y'' + 4*y = sin(x)" [ref=e56] [cursor=pointer]
+          - button "ode y'' + y = 0 with y(0) = 1, y'(0) = 0" [ref=e57] [cursor=pointer]
+          - button "taylor exp(x) order 4" [ref=e58] [cursor=pointer]
+          - button "taylor log(x) at x=1 order 3" [ref=e59] [cursor=pointer]
+          - button "convergence of sum 1/n from n=1 to oo" [ref=e60] [cursor=pointer]
+          - button "convergence of sum n/2^n from n=1 to oo" [ref=e61] [cursor=pointer]
+          - button "laplace exp(3*x)" [ref=e62] [cursor=pointer]
+          - button "inverse laplace 1/(s^2 + 1)" [ref=e63] [cursor=pointer]
+          - button "fourier x on [-pi, pi]" [ref=e64] [cursor=pointer]
+          - button "gradient of x^2*y + z" [ref=e65] [cursor=pointer]
+          - button "divergence of x*y, y*z, z*x" [ref=e66] [cursor=pointer]
+          - button "curl of y*z, x*z, x*y" [ref=e67] [cursor=pointer]
+          - button "laplacian of x^2 + y^2 + 3*z^2" [ref=e68] [cursor=pointer]

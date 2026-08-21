@@ -30,6 +30,9 @@ from app.services.series_engine import (
     try_solve_series, try_solve_continued_fraction, try_solve_product,
     try_convergence_tests, try_solve_taylor,
 )
+from app.services.series_integral_engine import try_series_integral
+from app.services.summation_limit_engine import try_series_limit
+from app.services.sum_of_integrals_engine import try_sum_of_integrals
 from app.services.pattern_matcher import try_symmetry_substitution, try_periodicity_reduction, classify_named_pattern
 from app.services.verification import numerical_verify, numeric_quad as _numeric_quad, verify_ode_numeric
 from app.services.ode_engine import solve_ode
@@ -39,6 +42,7 @@ from app.services.vector_engine import (
     numerical_verify_gradient, numerical_verify_divergence, numerical_verify_curl,
     numerical_verify_laplacian,
 )
+
 
 try:
     # Reuse the same LaTeX->plain-expression conversion already used for
@@ -82,6 +86,11 @@ TOPIC_KEYWORDS = {
     "Improper Integrals": ["improper integral", "∫ from -∞", "∫ to ∞"],
     "Multiple Integrals": ["double integral", "triple integral", "∬", "∭", "multiple integral"],
     "Vector Calculus": ["gradient", "divergence", "curl", "∇", "nabla"],
+    "Matrix Operations": ["matrix addition", "matrix subtraction", "scalar multiplication", "matrix multiplication",
+                         "matrix transpose", "adjoint", "adjugate", "matrix inverse", "matrix inverse",
+                         "matrix differentiation", "matrix integration", "matrix determinant", "matrix trace",
+                         "matrix rank", "eigenvalues", "eigenvectors", "inverse of matrix", "transpose of",
+                         "det of", "determinant of", "add matrices", "subtract matrices", "multiply matrices"],
     "Line Integrals": ["line integral", "∮", "path integral"],
     "Surface Integrals": ["surface integral"],
     "Green's Theorem": ["green's theorem", "green theorem"],
@@ -277,7 +286,7 @@ def parse_expression(expr_str: str):
     m = re.match(r'laplacian\s+(?:of\s+)?(.+)', expr_str, re.IGNORECASE)
     if m:
         return "laplacian", m.group(1).strip()
-
+    
     m = re.match(r'(simplify|expand|factor|cancel|apart|together)\s+(.+)', expr_str, re.IGNORECASE)
     if m:
         return "symbolic_operation", m.group(1).lower(), m.group(2).strip()
@@ -382,53 +391,6 @@ _POWER_NOTATION_FUNCS = sorted(
 )
 
 _POWER_NOTATION_FUNC_RE = re.compile(r"(" + "|".join(_POWER_NOTATION_FUNCS) + r")\^")
-
-
-def _find_integrand_series(integrand: str):
-    """If `integrand` contains a plain-text infinite/finite series
-    "sum <term> from <var>=<lower> to <upper>" (optionally prefixed by
-    "series of" - and possibly preceded by other tokens such as the
-    "integrate" keyword), return a 7-tuple
-    (term, var, lower, upper, start, end, upper_str) so callers can
-    rewrite just that span in place; otherwise None. The upper bound is
-    matched non-greedily and stops at the next "dx"/"from" boundary so the
-    series' *own* summation range ("from n=2 to infinity") is never confused
-    with an enclosing integral's integration bounds ("from 0 to 1/2")."""
-    m = re.search(
-        r'(?:sum|series)\s+(?:of\s+)?(.+?)\s+from\s+([a-zA-Z])\s*=\s*(.+?)\s+to\s+(.+?)(?=\s+d[a-zA-Z]\b|\s+from\b|\s*$)',
-        integrand, re.IGNORECASE,
-    )
-    if not m:
-        return None
-    return (
-        m.group(1).strip(),
-        m.group(2),
-        m.group(3).strip(),
-        m.group(4).strip(),
-        m.start(),
-        m.end(),
-        m.group(4).strip(),
-    )
-
-
-def _rewrite_integrand_series(integrand: str) -> str:
-    """Rewrite a plain-text series nested inside an integrand (or anywhere
-    in a to-be-parsed expression string) into sympy's Sum(...) call syntax,
-    e.g. "sum x^n from n=2 to infinity" -> "Sum(x^n,(n,2,oo))", replacing
-    only the matched span in place so surrounding tokens (like the leading
-    "integrate" keyword or the trailing "dx from 0 to 1/2") are preserved.
-    safe_sympify understands Sum(...) natively (it is in its local_dict), so
-    the integrand becomes a real sp.Sum object that the interchange-of-
-    summation-and-integration machinery can integrate term-by-term.
-    Non-series inputs are returned untouched."""
-    found = _find_integrand_series(integrand)
-    if found is None:
-        return integrand
-    term, var, lower, upper, start, end, _upper_str = found
-    if upper.lower() in ("oo", "infinity", "inf", "∞"):
-        upper = "oo"
-    replacement = f"Sum(({term}),({var},{lower},{upper}))"
-    return integrand[:start] + replacement + integrand[end:]
 
 
 def _consume_balanced_parens(text: str, pos: int) -> tuple[str | None, int]:
@@ -1791,10 +1753,11 @@ def _vector_calc_response(expression: str, parsed: tuple, topic: str, confidence
         verification=verified_msg,
         ai_confidence=0.85 if verified_ok else 0.4,
     )
-
-
+    
 def solve_calculus(request: SolveRequest) -> SolveResponse:
     expression = normalize_expression(request.expression)
+
+   
 
     if "\\" in expression and _normalize_latex_math is not None:
         # normalize_expression() only understands this solver's own
@@ -2407,6 +2370,8 @@ def solve_calculus(request: SolveRequest) -> SolveResponse:
                 _vector_calc_response(expression, parsed, topic, confidence),
                 request, expression, parsed,
             )
+
+       
 
         if parsed[0] == "limit":
             func_expr, var_name, pt = parsed[1], parsed[2], parsed[3]

@@ -1,0 +1,274 @@
+- generic [ref=e3]:
+  - complementary [ref=e4]:
+    - generic [ref=e5]:
+      - link "∫ Calculus Solver & Checker" [ref=e7] [cursor=pointer]:
+        - /url: /
+        - generic [ref=e8]: ∫
+        - generic [ref=e10]:
+          - generic [ref=e11]: Calculus Solver
+          - generic [ref=e12]: "& Checker"
+      - navigation [ref=e13]:
+        - link "Solver" [ref=e14] [cursor=pointer]:
+          - /url: /solve
+        - link "Library" [ref=e17] [cursor=pointer]:
+          - /url: /library
+        - link "Collections" [ref=e20] [cursor=pointer]:
+          - /url: /collections
+      - generic [ref=e23]:
+        - button "Dark Mode" [ref=e24] [cursor=pointer]
+        - generic [ref=e27]: Press Ctrl+K to search
+  - main [ref=e29]:
+    - generic [ref=e30]:
+      - generic [ref=e31]:
+        - button "Solve" [ref=e32] [cursor=pointer]
+        - button "Verify Solution" [ref=e33] [cursor=pointer]
+      - generic [ref=e34]:
+        - generic [ref=e35]: Enter a calculus problem
+        - textbox "e.g., integrate x^2 * sin(x) dx, solve x^2 - 4 = 0, simplify sin(x)^2 + cos(x)^2..." [ref=e36]: "\\sum_{n=1}^{4}\\int_{0}^{1}{n x^{n-1}\\,d x}"
+        - generic [ref=e37]:
+          - generic [ref=e38]: Or upload an image of the problem
+          - button "Click to upload image (handwritten or printed)" [ref=e39] [cursor=pointer]
+        - button "Solve" [ref=e45] [cursor=pointer]
+        - generic [ref=e48]:
+          - generic [ref=e49]: "Try:"
+          - button "integrate x^2 * sin(x) dx" [ref=e50] [cursor=pointer]
+          - button "solve x^2 - 4 = 0" [ref=e51] [cursor=pointer]
+          - button "simplify sin(x)^2 + cos(x)^2" [ref=e52] [cursor=pointer]
+          - button "derivative of x^3 * e^x" [ref=e53] [cursor=pointer]
+          - button "limit of sin(x)/x as x -> 0" [ref=e54] [cursor=pointer]
+          - button "integrate 1/(x^2 + 1) dx" [ref=e55] [cursor=pointer]
+          - button "y'' + 4*y = sin(x)" [ref=e56] [cursor=pointer]
+          - button "ode y'' + y = 0 with y(0) = 1, y'(0) = 0" [ref=e57] [cursor=pointer]
+          - button "taylor exp(x) order 4" [ref=e58] [cursor=pointer]
+          - button "taylor log(x) at x=1 order 3" [ref=e59] [cursor=pointer]
+          - button "convergence of sum 1/n from n=1 to oo" [ref=e60] [cursor=pointer]
+          - button "convergence of sum n/2^n from n=1 to oo" [ref=e61] [cursor=pointer]
+          - button "laplace exp(3*x)" [ref=e62] [cursor=pointer]
+          - button "inverse laplace 1/(s^2 + 1)" [ref=e63] [cursor=pointer]
+          - button "fourier x on [-pi, pi]" [ref=e64] [cursor=pointer]
+          - button "gradient of x^2*y + z" [ref=e65] [cursor=pointer]
+          - button "divergence of x*y, y*z, z*x" [ref=e66] [cursor=pointer]
+          - button "curl of y*z, x*z, x*y" [ref=e67] [cursor=pointer]
+          - button "laplacian of x^2 + y^2 + 3*z^2" [ref=e68] [cursor=pointer]
+      - generic [ref=e77]:
+        - generic [ref=e80]:
+          - generic [ref=e81]: Text extracted from image
+          - generic [ref=e82]: No text could be extracted.
+        - generic [ref=e84]:
+          - generic [ref=e85]:
+            - generic [ref=e86]:
+              - text: Series Integrals
+              - generic [ref=e89]: Medium
+            - generic [ref=e93]:
+              - math [ref=e95]:
+                - generic [ref=e97]:
+                  - generic [ref=e98]:
+                    - generic [ref=e99]: ∑
+                    - generic [ref=e100]:
+                      - generic [ref=e101]: "n"
+                      - generic [ref=e102]: =
+                      - generic [ref=e103]: "1"
+                    - generic [ref=e104]: "4"
+                  - generic [ref=e105]:
+                    - generic [ref=e106]: ∫
+                    - generic [ref=e107]: "0"
+                    - generic [ref=e108]: "1"
+                  - generic [ref=e109]: "n"
+                  - generic [ref=e110]:
+                    - generic [ref=e111]: x
+                    - generic [ref=e112]:
+                      - generic [ref=e113]: "n"
+                      - generic [ref=e114]: −
+                      - generic [ref=e115]: "1"
+                  - generic [ref=e116]: d
+                  - generic [ref=e117]: x
+              - generic [ref=e119]:
+                - generic [ref=e123]:
+                  - generic [ref=e124]: n=1
+                  - generic [ref=e126]: ∑
+                  - generic [ref=e127]: "4"
+                - generic [ref=e132]:
+                  - text: ∫
+                  - generic [ref=e136]:
+                    - generic [ref=e137]: "0"
+                    - generic [ref=e139]: "1"
+                - text: "n"
+                - generic [ref=e144]:
+                  - text: x
+                  - generic [ref=e145]: n−1
+                - text: dx
+          - generic [ref=e151]: "Confidence: 95%"
+        - generic [ref=e152]:
+          - generic [ref=e153]: Answer
+          - generic [ref=e156]:
+            - math [ref=e158]:
+              - generic [ref=e159]: "4"
+            - generic [ref=e162]: "4"
+        - generic [ref=e164]:
+          - generic [ref=e165]: Verification
+          - paragraph [ref=e169]: "Verified: symbolic value 4 matches independent numeric term-by-term integration of the original expression."
+        - generic [ref=e170]:
+          - generic [ref=e171]:
+            - button "Step-by-Step (3)" [ref=e172] [cursor=pointer]
+            - button "Understanding (19)" [ref=e173] [cursor=pointer]
+            - button "Alternative Methods (0)" [ref=e174] [cursor=pointer]
+            - button "Formulas Used (1)" [ref=e175] [cursor=pointer]
+          - generic [ref=e177]:
+            - generic [ref=e178]:
+              - generic [ref=e179]: "1"
+              - generic [ref=e180]:
+                - generic [ref=e181]: Recognize a sum of definite integrals
+                - generic [ref=e185]:
+                  - math [ref=e187]:
+                    - generic [ref=e189]:
+                      - generic [ref=e190]:
+                        - generic [ref=e191]: ∑
+                        - generic [ref=e192]:
+                          - generic [ref=e193]: "n"
+                          - generic [ref=e194]: =
+                          - generic [ref=e195]: "1"
+                        - generic [ref=e196]: "4"
+                      - generic [ref=e197]:
+                        - generic [ref=e198]: ∫
+                        - generic [ref=e199]: "0"
+                        - generic [ref=e200]: "1"
+                      - generic [ref=e201]: "n"
+                      - generic [ref=e202]:
+                        - generic [ref=e203]: x
+                        - generic [ref=e204]:
+                          - generic [ref=e205]: "n"
+                          - generic [ref=e206]: −
+                          - generic [ref=e207]: "1"
+                      - generic [ref=e208]: d
+                      - generic [ref=e209]: x
+                  - generic [ref=e211]:
+                    - generic [ref=e215]:
+                      - generic [ref=e216]: n=1
+                      - generic [ref=e218]: ∑
+                      - generic [ref=e219]: "4"
+                    - generic [ref=e224]:
+                      - text: ∫
+                      - generic [ref=e228]:
+                        - generic [ref=e229]: "0"
+                        - generic [ref=e231]: "1"
+                    - text: "n"
+                    - generic [ref=e236]:
+                      - text: x
+                      - generic [ref=e237]: n−1
+                    - text: dx
+                - generic [ref=e243]: Each summand is a definite integral in x; evaluate the inner integral first, then sum over n.
+            - generic [ref=e246]:
+              - generic [ref=e247]: "2"
+              - generic [ref=e248]:
+                - generic [ref=e249]: Evaluate the inner integral (Fundamental Theorem of Calculus)
+                - generic [ref=e253]:
+                  - math [ref=e255]:
+                    - generic [ref=e257]:
+                      - generic [ref=e258]: "{"
+                      - generic [ref=e259]:
+                        - generic [ref=e260]:
+                          - generic [ref=e263]:
+                            - generic [ref=e264]: "1"
+                            - generic [ref=e265]: −
+                            - generic [ref=e266]:
+                              - generic [ref=e267]: "0"
+                              - generic [ref=e268]: "n"
+                          - generic [ref=e271]:
+                            - generic [ref=e272]: for
+                            - generic [ref=e273]:
+                              - generic [ref=e274]: (
+                              - generic [ref=e275]: "n"
+                              - generic [ref=e276]: ">"
+                              - generic [ref=e277]: −
+                              - generic [ref=e278]: ∞
+                              - generic [ref=e279]: ∨
+                              - generic [ref=e280]: "n"
+                              - generic [ref=e281]: ">"
+                              - generic [ref=e282]: "0"
+                              - generic [ref=e283]: )
+                            - generic [ref=e284]: ∧
+                            - generic [ref=e285]:
+                              - generic [ref=e286]: (
+                              - generic [ref=e287]: "n"
+                              - generic [ref=e288]: ">"
+                              - generic [ref=e289]: −
+                              - generic [ref=e290]: ∞
+                              - generic [ref=e291]: ∨
+                              - generic [ref=e292]: "n"
+                              - generic [ref=e293]: <
+                              - generic [ref=e294]: ∞
+                              - generic [ref=e295]: )
+                            - generic [ref=e296]: ∧
+                            - generic [ref=e297]:
+                              - generic [ref=e298]: (
+                              - generic [ref=e299]: "n"
+                              - generic [ref=e300]: ">"
+                              - generic [ref=e301]: "0"
+                              - generic [ref=e302]: ∨
+                              - generic [ref=e303]: "n"
+                              - generic [ref=e304]: <
+                              - generic [ref=e305]: "0"
+                              - generic [ref=e306]: )
+                            - generic [ref=e307]: ∧
+                            - generic [ref=e308]:
+                              - generic [ref=e309]: (
+                              - generic [ref=e310]: "n"
+                              - generic [ref=e311]: <
+                              - generic [ref=e312]: "0"
+                              - generic [ref=e313]: ∨
+                              - generic [ref=e314]: "n"
+                              - generic [ref=e315]: <
+                              - generic [ref=e316]: ∞
+                              - generic [ref=e317]: )
+                        - generic [ref=e318]:
+                          - generic [ref=e321]:
+                            - generic [ref=e322]:
+                              - generic [ref=e323]: ∞
+                              - generic [ref=e324]: "n"
+                            - generic [ref=e325]:
+                              - generic [ref=e326]: ∣
+                              - generic [ref=e327]: "n"
+                              - generic [ref=e328]: ∣
+                          - generic [ref=e331]:
+                            - generic [ref=e332]: for
+                            - generic [ref=e333]: "n"
+                            - generic [ref=e334]: ≥
+                            - generic [ref=e335]: "0"
+                  - generic [ref=e338]:
+                    - generic [ref=e339]: "{"
+                    - generic [ref=e341]:
+                      - generic [ref=e345]:
+                        - generic [ref=e346]:
+                          - text: 1 −
+                          - generic [ref=e347]:
+                            - text: "0"
+                            - generic [ref=e348]: "n"
+                        - generic [ref=e359]:
+                          - generic [ref=e362]:
+                            - generic [ref=e363]: ∣
+                            - generic [ref=e364]: "n"
+                            - generic [ref=e365]: ∣
+                          - generic [ref=e367]: ∞n
+                      - generic [ref=e378]:
+                        - generic [ref=e379]:
+                          - generic [ref=e380]: for
+                          - generic [ref=e381]: (n > −∞ ∨ n > 0)
+                          - text: ∧
+                          - generic [ref=e382]: (n > −∞ ∨ n < ∞)
+                          - text: ∧
+                          - generic [ref=e383]: (n > 0 ∨ n < 0)
+                          - text: ∧
+                          - generic [ref=e384]: (n < 0 ∨ n < ∞)
+                        - generic [ref=e385]:
+                          - generic [ref=e386]: for
+                          - text: n ≥ 0
+                - generic [ref=e390]: Integrating the term with respect to x on the given bounds keeps n as a parameter.
+            - generic [ref=e393]:
+              - generic [ref=e394]: "3"
+              - generic [ref=e395]:
+                - generic [ref=e396]: Take the outer sum
+                - generic [ref=e400]:
+                  - math [ref=e402]:
+                    - generic [ref=e403]: "4"
+                  - generic [ref=e406]: "4"
+                - generic [ref=e408]: Sum the result over every n from 1 to 4.

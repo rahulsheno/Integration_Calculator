@@ -305,6 +305,30 @@ def normalize_latex_math(latex_text: str) -> str:
     if multiple_integral and not _has_untranslated_latex_artifacts(multiple_integral):
         return multiple_integral
 
+    # Series-inside-integral (e.g. \int_0^{1/2} \sum_{n=2}^{\infty} x^n dx):
+    # checked before the generic integral path, which would hand the \sum to
+    # latex2sympy and lose the "sum ... from n=a to b" grammar the solver's
+    # dedicated series-integral engine needs.
+    series_integral = _series_integral_expression_from_latex(text)
+    if series_integral and not _has_untranslated_latex_artifacts(series_integral):
+        return series_integral
+
+    # Limit of a partial sum (e.g. \lim_{n\to\infty} \sum_{i=1}^{n} ...):
+    # same reason - keep the sum in the plain grammar the dedicated
+    # summation-limit engine understands instead of losing it through
+    # latex2sympy's Sum() printout.
+    summation_limit = _summation_limit_expression_from_latex(text)
+    if summation_limit and not _has_untranslated_latex_artifacts(summation_limit):
+        return summation_limit
+
+    # Sum of definite integrals (e.g. \sum_{n=1}^{4} \int_0^1 n x^{n-1} dx):
+    # the mirror shape where the \sum is the OUTER operator. Nothing else
+    # here can express it, so without this extractor the OCR text is
+    # rejected despite being read correctly.
+    sum_of_integrals = _sum_of_integrals_expression_from_latex(text)
+    if sum_of_integrals and not _has_untranslated_latex_artifacts(sum_of_integrals):
+        return sum_of_integrals
+
     integral = _integral_expression_from_latex(text)
     if integral and not _has_untranslated_latex_artifacts(integral):
         return integral
@@ -425,7 +449,6 @@ def _consume_bound(text: str, pos: int) -> tuple[str | None, int]:
     if not tok_match:
         return None, pos
     return tok_match.group(0), pos + tok_match.end()
-
 
 def _multiple_integral_expression_from_latex(text: str) -> str:
     """Recognize a nested/iterated multiple integral (double, triple, or
@@ -559,6 +582,108 @@ def _integral_expression_from_latex(text: str) -> str:
     return f"integrate {integrand} d{variable}"
 
 
+def _plain_sum_bound(latex: str | None, *, default_infinity: bool = False) -> str | None:
+    r"""Convert a \sum subscript/superscript bound (already brace-stripped by
+    _consume_bound) into plain-text form without going through latex2sympy -
+    a bound like "n=2" is a grammar token, not an expression, and
+    latex2sympy turns it into Eq(n, 2), which would corrupt the output.
+    Only the common LaTeX constants inside bounds get translated here."""
+    if latex is None:
+        return "oo" if default_infinity else None
+    t = latex.strip().strip("{}").strip()
+    if re.fullmatch(r"\\(?:infty|inf|infinity)", t) or t.lower() in ("oo", "inf", "infinity", "∞"):
+        return "oo"
+    t = re.sub(r"\\(?:infty|inf|infinity)", "oo", t)
+    t = t.replace("\\pi", "pi").replace("^", "**")
+    return t or None
+
+
+def _series_integral_expression_from_latex(text: str) -> str:
+    """Recognize a definite integral whose integrand is (or is wrapped in
+    parens around) a \\sum series, e.g.
+
+        \\int_{0}^{1/2} \\left( \\sum_{n=2}^{\\infty} x^{n} \\right) \\, dx
+
+    and convert it to the plain-text grammar the series-integral engine
+    understands: "integrate sum x^n from n=2 to oo dx from 0 to 1/2".
+
+    _integral_expression_from_latex can't handle these: its integrand step
+    funnels the whole \\sum into latex2sympy, which converts it into sympy's
+    Sum(...) printout - an unrecognized shape downstream - or fails outright.
+    Handling the sum structure here, before that path runs, keeps the OCR
+    output anchored to a grammar the solver already fully supports.
+    """
+    start_match = re.match(r"\\int\s*", text)
+    if not start_match:
+        return ""
+    pos = start_match.end()
+
+    lower_latex = None
+    upper_latex = None
+    for _ in range(2):
+        if pos < len(text) and text[pos] == "_":
+            lower_latex, pos = _consume_bound(text, pos + 1)
+        elif pos < len(text) and text[pos] == "^":
+            upper_latex, pos = _consume_bound(text, pos + 1)
+        else:
+            break
+
+    end_match = re.search(r"(.*?)\s*d\s*([a-zA-Z])\s*$", text[pos:], re.DOTALL)
+    if not end_match:
+        return ""
+    middle = end_match.group(1).strip()
+    variable = end_match.group(2)
+
+    # Unwrap a single outer paren pair around the whole sum, e.g. the
+    # "\left( \sum ... \right)" shape OCR models favor.
+    while middle.startswith("(") and middle.endswith(")"):
+        inner, after = _consume_balanced(middle, 0, "(", ")")
+        if inner is None or after != len(middle):
+            break
+        middle = inner.strip()
+
+    if not middle.startswith("\\sum"):
+        return ""
+    spos = len("\\sum")
+
+    sum_lower_latex = None
+    sum_upper_latex = None
+    for _ in range(2):
+        if spos < len(middle) and middle[spos] == "_":
+            sum_lower_latex, spos = _consume_bound(middle, spos + 1)
+        elif spos < len(middle) and middle[spos] == "^":
+            sum_upper_latex, spos = _consume_bound(middle, spos + 1)
+        else:
+            break
+
+    term_latex = middle[spos:].strip()
+    if not term_latex or not sum_lower_latex or "=" not in sum_lower_latex:
+        return ""
+
+    var_name, sum_lower = sum_lower_latex.split("=", 1)
+    var_name = var_name.strip().strip("{}").strip()
+    if not re.fullmatch(r"[a-zA-Z]", var_name):
+        return ""
+
+    slo = _plain_sum_bound(sum_lower)
+    shi = _plain_sum_bound(sum_upper_latex, default_infinity=True)
+    if slo is None or shi is None:
+        return ""
+
+    term = _latex_expression_to_plain(term_latex)
+    if not _is_valid_math_fragment(term):
+        return ""
+
+    suffix = f"integrate sum {term} from {var_name}={slo} to {shi} d{variable}"
+    if lower_latex is None or upper_latex is None:
+        return suffix
+    lower = _latex_expression_to_plain(lower_latex)
+    upper = _latex_expression_to_plain(upper_latex)
+    if not _is_valid_math_fragment(lower) or not _is_valid_math_fragment(upper):
+        return ""
+    return f"{suffix} from {lower} to {upper}"
+
+
 def _strip_default_log_base_10(result: str, original_latex: str) -> str:
     """Undo latex2sympy2's convention of converting a bare "\\log" (no
     explicit subscript) to the two-argument form log(arg, 10) - i.e.
@@ -657,8 +782,10 @@ _KNOWN_MATH_WORDS = {
     # like an untranslated leftover and the whole conversion is thrown away.
     "sum", "product",
     # scaffolding words this module itself generates, e.g. "integrate x+1 dx
-    # from 0 to 1" - these must never be flagged as untranslated LaTeX.
+    # from 0 to 1" or "limit of sum i/n^2 from i=1 to n as n -> oo" - these
+    # must never be flagged as untranslated LaTeX.
     "integrate", "from", "to",
+    "limit", "of", "as",
 }
 
 
@@ -801,9 +928,26 @@ def _rewrite_latex_function_powers(text: str) -> str:
 
 def _latex_to_plain_fallback(text: str) -> str:
     plain = text
+    # Convert LaTeX constants BEFORE any identifier-splitting: the
+    # "split unknown multi-letter identifiers" pass would otherwise turn
+    # "\infty" (already brace-stripped to "infty") into "i*n*f*t*y" -
+    # exactly how a real OCR'd sum bound of infinity became
+    # "from n=1 to i*n*f*t*y" and silently stopped parsing.
+    plain = plain.replace(r"\infty", "oo").replace(r"\pi", "pi")
     plain = _replace_balanced_command(plain, r"\frac", 2, lambda args: f"({args[0]})/({args[1]})")
     plain = _replace_balanced_command(plain, r"\sqrt", 1, lambda args: f"sqrt({args[0]})")
     plain = _rewrite_latex_function_powers(plain)
+    # Implicit multiplication between a factor (possibly the closing}"}"
+    # of a braced group) and a directly-attached LaTeX command,
+    # e.g. "x^{n}\ln(x)" or "n\sin(nx)": the command replacement below
+    # emits "x^(n) ln(x)" -> "x^(n)ln(x)" (or "nsin(nx)") once whitespace
+    # collapses, a fused unrecognized construct the artifact guard
+    # rejects. Fix it here, while the backslash still marks the boundary.
+    plain = re.sub(
+        r"([0-9a-zA-Z})])(\\(?:sin|cos|tan|cot|sec|csc|log|ln|exp|pi)\b)",
+        r"\1*\2",
+        plain,
+    )
     # Handle bare (brace-less) function application like "\cos x" or
     # "\sin 2x" BEFORE the generic name replacement below. Without this,
     # "\cos x" becomes "cos" + "x" and then, once all whitespace is
@@ -819,8 +963,38 @@ def _latex_to_plain_fallback(text: str) -> str:
     plain = plain.replace(r"\log", "log").replace(r"\ln", "ln")
     plain = plain.replace("{", "(").replace("}", ")")
     plain = plain.replace("\\", "")
+    # Implicit multiplication: OCR routinely writes "n x^{n-1}" or "2 x"
+    # with no "*". Without inserting it, juxtaposed factors fuse into a
+    # single unrecognized word ("nx") once whitespace is collapsed, which
+    # the artifact guard then rejects as leftover LaTeX even though every
+    # other part converted correctly.
+    plain = re.sub(r"([A-Za-z0-9)])\s+([A-Za-z0-9(])", r"\1*\2", plain)
     plain = re.sub(r"\s+", "", plain)
+    # Same juxtaposition inside parens has no space to detect ("sin(nx)"),
+    # so split any multi-letter identifier that isn't a known math word
+    # into single-letter variables joined by "*": "nx" -> "n*x". Known
+    # function names and constants are left untouched.
+    plain = re.sub(r"[A-Za-z]{2,}", _split_unknown_identifier, plain)
     return plain
+
+
+_SPLIT_KEEP_WORDS = _KNOWN_MATH_WORDS | {
+    "sin", "cos", "tan", "cot", "sec", "csc",
+    "asin", "acos", "atan", "acot", "asec", "acsc",
+    "sinh", "cosh", "tanh", "coth", "sech", "csch",
+    "arcsin", "arccos", "arctan",
+    "sqrt", "e", "E",
+    "dx", "dy", "dz", "dt", "du", "dv", "dw",
+}
+
+
+def _split_unknown_identifier(match) -> str:
+    word = match.group(0)
+    if word in _SPLIT_KEEP_WORDS or word.lower() in _SPLIT_KEEP_WORDS:
+        return word
+    if re.fullmatch(r"d[a-zA-Z]", word):  # dx, dy, dz, dt, ...
+        return word
+    return "*".join(word)
 
 
 def _replace_balanced_command(text: str, command: str, arg_count: int, render) -> str:
@@ -881,6 +1055,118 @@ def _nested_x2_plus_x_expression(text: str) -> str:
     if (has_nested_marker or has_repeated_root) and re.search(r"x\^?2\+x", normalized):
         return "x+1"
     return ""
+
+
+def _summation_limit_expression_from_latex(text: str) -> str:
+    r"""Recognize a limit of a partial sum, e.g.
+
+        \\operatorname*{lim}_{n\\to\\infty} \\sum_{i=1}^{n}{\\frac{n}{n^2+i^2}}
+
+    and convert it to the plain grammar the summation-limit engine
+    understands: "limit of sum n/(n^2+i^2) from i=1 to n as n -> oo".
+
+    Handles the "\operatorname*{lim}" spelling OCR models favor (bare
+    "\lim" as well), "\to"/"\rightarrow", and an optional extra brace pair
+    around the summand - both common in real pix2tex/pix2text output.
+    The limit variable is required to appear as the sum's upper bound
+    (\sum_{i=1}^{n} with "\lim_{n\to\infty}"), which is the standard shape
+    for these textbook problems.
+    """
+    norm = text.replace(r"\operatorname*{lim}", r"\lim").replace(r"\operatorname{lim}", r"\lim")
+    m = re.match(
+        r"^\s*\\lim\s*_\{\s*([a-zA-Z])\s*\\(?:to|rightarrow)\s*\\infty\s*\}\s*"
+        r"\\sum\s*_\{\s*([a-zA-Z])\s*=\s*([^{}]+?)\s*\}\s*"
+        r"\^\{?([^{}]+?)\}?\s*(.+?)\s*$",
+        norm,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not m:
+        return ""
+    nvar, svar, lower, upper, term_latex = m.groups()
+    upper = upper.strip()
+
+    # Require the upper bound to be the limit variable - anything else is a
+    # different (unsupported) shape; better to fall through honestly than
+    # fabricate a mismatched plain-text rendering.
+    if upper != nvar:
+        return ""
+
+    lowered = _latex_expression_to_plain(lower)
+    # NOTE: no brace-stripping here - str.strip('{}') is membership-based,
+    # not pair-aware, and mangles "{\frac{a}{b}}" into "\frac{a}{b", by
+    # removing the trailing brace whose matching opener is after the
+    # leading "\f...". The converters in this module already understand
+    # the outer braces as grouping syntax.
+    term = _latex_expression_to_plain(term_latex.strip())
+    if not lowered or not term:
+        return ""
+    if not _is_valid_math_fragment(lowered) or not _is_valid_math_fragment(term):
+        return ""
+    return f"limit of sum {term} from {svar}={lowered} to {upper} as {nvar} -> oo"
+
+
+def _sum_of_integrals_expression_from_latex(text: str) -> str:
+    r"""Recognize a sum of definite integrals, e.g.
+
+        \\sum_{n=1}^{4} \\int_{0}^{1}{n x^{n-1} \\,d x}
+
+    and convert it to the plain grammar the sum-of-integrals engine
+    understands: "sum integrate n*x^(n-1) dx from 0 to 1 from n=1 to 4".
+
+    Needed because _series_integral_expression_from_latex only matches
+    integrals-with-sums-inside, and the generic _integral_expression_from_latex
+    cannot express a \\sum at all - the whole shape silently fell through
+    every extractor and the OCR text was rejected even though it read fine.
+    """
+    m = re.match(
+        r"^\s*\\sum\s*_\{\s*([a-zA-Z])\s*=\s*([^{}]+?)\s*\}\s*\^\{?([^{}]+?)\}?\s*"
+        r"\\int\s*(?:_(\{[^{}]*\}|[^_^ ]+))?\s*(?:\^(\{[^{}]*\}|[^_^ ]+))?\s*(.+?)\s*$",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not m:
+        return ""
+    svar, lower, upper, int_lo, int_hi, rest = m.groups()
+    if int_lo is None or int_hi is None:
+        return ""
+
+    # The OCR shape wraps the whole integrand in one brace pair,
+    # "{n x^{n-1} \,d x}" - unwrap it FIRST so the term/dx split below
+    # never has to decide whether a given '}' closes the exponent or
+    # the wrapper.
+    rest = rest.strip()
+    if rest.startswith("{"):
+        depth, k = 0, 0
+        while k < len(rest):
+            if rest[k] == "{":
+                depth += 1
+            elif rest[k] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        if depth == 0 and k == len(rest) - 1:
+            rest = rest[1:-1].strip()
+
+    dm = re.search(r"(.*?)\s+d\s*([a-zA-Z])\s*$", rest, re.DOTALL)
+    if not dm:
+        return ""
+    term_latex, dvar = dm.group(1).strip(), dm.group(2)
+
+    lowered = _latex_expression_to_plain(lower)
+    uppered = _latex_expression_to_plain(upper)
+    lo = _latex_expression_to_plain(int_lo)
+    hi = _latex_expression_to_plain(int_hi)
+    term = _latex_expression_to_plain(term_latex)
+    # NOTE: no .strip('{}') on 'term' - that corrupts "{\frac{a}{b}}" - see
+    # the identical note on _summation_limit_expression_from_latex.
+    if not all((lo, hi, term, lowered, uppered)):
+        return ""
+    for frag in (lo, hi, term, lowered, uppered):
+        if not _is_valid_math_fragment(frag):
+            return ""
+    return (f"sum integrate {term} d{dvar} from {lo} to {hi} "
+            f"from {svar}={lowered} to {uppered}")
 
 
 def normalize_math_ocr_text(text: str) -> str:
